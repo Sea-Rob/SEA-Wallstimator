@@ -1,0 +1,17 @@
+[package]
+name = "geometry-core"
+version = "0.1.0"
+edition = "2021"
+description = "Wallstimator geometry core: frame processing for the live capture pipeline, compiled to WASM (ADR-0001)."
+license = "UNLICENSED"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack would download its own binaryen; CI and dev run the installed wasm-opt explicitly.
+wasm-opt = false

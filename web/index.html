@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Wallstimator — capture</title>
+  <link rel="icon" href="data:," />
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    header { padding: 0.75rem 1rem; text-align: center; }
+    h1 { font-size: 1.1rem; margin: 0; }
+    #status { font-size: 0.8rem; color: #9a9; margin-top: 0.25rem; }
+    #overlay {
+      max-width: 100%;
+      background: #000;
+      border-radius: 8px;
+    }
+    #error {
+      display: none;
+      margin: 1rem;
+      padding: 1rem;
+      max-width: 32rem;
+      background: #3a1414;
+      border: 1px solid #a33;
+      border-radius: 8px;
+      color: #fbb;
+    }
+    #error.visible { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Wallstimator capture — walking skeleton</h1>
+    <div id="status">loading…</div>
+  </header>
+  <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
+  <video id="camera" playsinline muted hidden></video>
+  <canvas id="overlay" width="640" height="480"></canvas>
+  <div id="error" role="alert"></div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
