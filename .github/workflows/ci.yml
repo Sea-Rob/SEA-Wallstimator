@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -26,8 +30,19 @@ jobs:
           curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
           sudo apt-get update -q && sudo apt-get install -y -q binaryen
 
-      - name: Run geometry-core unit tests
+      - name: Run Rust unit tests
         run: cargo test --workspace
+
+      - name: Run JS unit tests (print-scale correction, session state)
+        run: npm run test:js
+
+      - name: Verify committed Reference Marker PDF matches the generator
+        run: |
+          npm run build:pdf
+          git diff --exit-code web/reference-marker.pdf || {
+            echo "::error::web/reference-marker.pdf is stale — run 'npm run build:pdf' and commit the result"
+            exit 1
+          }
 
       - name: Build WASM bundle
         run: npm run build:wasm

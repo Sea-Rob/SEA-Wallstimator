@@ -1,0 +1,10 @@
+[package]
+name = "marker-pdf"
+version = "0.1.0"
+edition = "2021"
+description = "Generates the two-page A4 Reference Marker PDF (deterministic, zero-dependency PDF writer). The output is committed at web/reference-marker.pdf."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+geometry-core = { path = "../geometry-core" }

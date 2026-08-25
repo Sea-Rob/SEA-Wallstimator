@@ -12,6 +12,27 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod marker;
+
+/// Nominal printed length of the Reference Marker PDF's ruler strip (mm).
+/// The capture page divides the Homeowner's measured length by this to get
+/// the session's print-scale correction factor (ADR-0002).
+///
+/// Consumption rule for all metric math in this crate (issue #3 onward):
+/// the marker's true physical side is `marker_side_mm() * correction_factor`
+/// — MULTIPLY nominal printed dimensions by the factor, never divide. A sheet
+/// printed at 94% has factor 0.94 and a 141 mm marker.
+#[wasm_bindgen]
+pub fn ruler_nominal_mm() -> f64 {
+    marker::RULER_LENGTH_MM
+}
+
+/// Nominal printed side length of a Reference Marker's black square (mm).
+#[wasm_bindgen]
+pub fn marker_side_mm() -> f64 {
+    marker::MARKER_SIDE_MM
+}
+
 /// BT.601 integer luma approximation of one RGBA pixel.
 #[inline]
 pub fn rgba_to_luma(r: u8, g: u8, b: u8) -> u8 {

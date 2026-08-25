@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/geometry-core"]
+members = ["crates/geometry-core", "crates/marker-pdf"]
 
 [profile.release]
 opt-level = "s"

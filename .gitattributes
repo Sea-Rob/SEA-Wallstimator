@@ -1,0 +1,4 @@
+# The Reference Marker PDF is offset-sensitive: any line-ending rewrite breaks
+# its xref table and stream lengths. Never treat PDFs as text.
+*.pdf binary
+*.wasm binary

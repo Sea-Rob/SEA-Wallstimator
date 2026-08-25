@@ -18,6 +18,7 @@ const MIME = {
   ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".wasm": "application/wasm",
+  ".pdf": "application/pdf",
   ".json": "application/json",
   ".ts": "text/plain; charset=utf-8",
 };
