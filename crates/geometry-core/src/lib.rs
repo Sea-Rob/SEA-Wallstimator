@@ -1,18 +1,27 @@
 //! Wallstimator geometry core.
 //!
-//! Walking-skeleton slice: proves the JS <-> WASM frame path that every later
-//! stage of the live capture pipeline (Reference Marker detection, homography
-//! chaining, metric rectification — see ADR-0001) will ride on.
+//! Live path (walking skeleton): the capture page writes camera frames
+//! (RGBA) directly into WASM memory via [`FrameProcessor::input_ptr`], calls
+//! [`FrameProcessor::process`], and reads the visibly-processed overlay back
+//! out via [`FrameProcessor::output_ptr`]. No per-frame allocation or
+//! marshalling copies across the wasm-bindgen boundary itself (the JS side
+//! still copies pixels in and out of its canvases).
 //!
-//! The capture page writes camera frames (RGBA) directly into WASM memory via
-//! [`FrameProcessor::input_ptr`], calls [`FrameProcessor::process`], and reads
-//! the visibly-processed overlay back out via [`FrameProcessor::output_ptr`].
-//! No per-frame allocation or marshalling copies across the wasm-bindgen
-//! boundary itself (the JS side still copies pixels in and out of its canvases).
+//! Still path (issue #3): [`FrameProcessor::rectify_captured`] runs the full
+//! classical pipeline on the current input frame — Reference Marker
+//! detection ([`detect`]), wall-plane homography estimation via DLT + RANSAC
+//! + LM ([`homography`]), and metric inverse-warp rendering ([`rectify`]) —
+//! and returns a [`RectifiedWallImage`] with a mm/px scale and the
+//! reprojection residuals.
 
 use wasm_bindgen::prelude::*;
 
+pub mod detect;
+pub mod homography;
+pub mod linalg;
 pub mod marker;
+pub mod rectify;
+pub mod synthetic;
 
 /// Nominal printed length of the Reference Marker PDF's ruler strip (mm).
 /// The capture page divides the Homeowner's measured length by this to get
@@ -163,6 +172,142 @@ impl FrameProcessor {
         sobel_edges(&self.gray, &mut self.edges, self.width, self.height);
         compose_overlay(&self.gray, &self.edges, &mut self.output_rgba);
     }
+
+    /// Still-frame rectification (issue #3): detect Reference Marker(s) in
+    /// the frame currently in the input buffer, estimate the wall-plane
+    /// homography (DLT + RANSAC + LM), and render the Rectified Wall Image.
+    ///
+    /// `correction_factor` is the session's print-scale factor (ADR-0002):
+    /// the marker's true physical side is `marker_side_mm() *
+    /// correction_factor` (MULTIPLY, never divide). Returns `null` when no
+    /// Reference Marker is detected.
+    pub fn rectify_captured(&self, correction_factor: f64) -> Option<RectifiedWallImage> {
+        let r = rectify::rectify_frame(&self.input_rgba, self.width, self.height, correction_factor)?;
+        Some(RectifiedWallImage::from_core(r))
+    }
+}
+
+/// A Rectified Wall Image: the captured frame re-projected to
+/// fronto-parallel metric coordinates. Pixels are exposed zero-copy via
+/// [`RectifiedWallImage::pixels_ptr`]; the metric mapping is
+/// `wall_mm = origin_mm + pixel * mm_per_px` on both axes.
+#[wasm_bindgen]
+pub struct RectifiedWallImage {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    mm_per_px: f64,
+    origin_x_mm: f64,
+    origin_y_mm: f64,
+    marker_ids: Vec<u16>,
+    second_marker_rejected: bool,
+    residual_rms_px: f64,
+    residual_max_px: f64,
+    points_used: u32,
+    inliers: u32,
+}
+
+impl RectifiedWallImage {
+    fn from_core(r: rectify::Rectified) -> Self {
+        RectifiedWallImage {
+            rgba: r.rgba,
+            width: r.width as u32,
+            height: r.height as u32,
+            mm_per_px: r.mm_per_px,
+            origin_x_mm: r.origin_mm[0],
+            origin_y_mm: r.origin_mm[1],
+            marker_ids: r.marker_ids,
+            second_marker_rejected: r.second_marker_rejected,
+            residual_rms_px: r.estimate.rms,
+            residual_max_px: r.estimate.max,
+            points_used: r.estimate.residuals.len() as u32,
+            inliers: r.estimate.inliers as u32,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl RectifiedWallImage {
+    /// Pointer to the tightly packed RGBA pixels in WASM memory.
+    pub fn pixels_ptr(&self) -> *const u8 {
+        self.rgba.as_ptr()
+    }
+
+    pub fn pixels_len(&self) -> usize {
+        self.rgba.len()
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Millimetres of wall per rectified pixel (isotropic, print-scale
+    /// correction already applied).
+    pub fn mm_per_px(&self) -> f64 {
+        self.mm_per_px
+    }
+
+    /// Wall-plane mm coordinate of the image's top-left corner (the anchor
+    /// marker's printed top-left corner is the plane origin).
+    pub fn origin_x_mm(&self) -> f64 {
+        self.origin_x_mm
+    }
+
+    pub fn origin_y_mm(&self) -> f64 {
+        self.origin_y_mm
+    }
+
+    /// IDs of the Reference Markers used for the estimate, anchor first.
+    pub fn marker_ids(&self) -> Vec<u16> {
+        self.marker_ids.clone()
+    }
+
+    /// True when a second marker was detected but its constraint was
+    /// discarded (bad detection or inconsistent joint fit): the result
+    /// degraded to single-marker extrapolation and the page must say so.
+    pub fn second_marker_rejected(&self) -> bool {
+        self.second_marker_rejected
+    }
+
+    /// RMS reprojection error of the marker corners under the estimated
+    /// homography, in source-frame pixels. The Error Bound story (see
+    /// CONTEXT.md) starts from this number.
+    pub fn residual_rms_px(&self) -> f64 {
+        self.residual_rms_px
+    }
+
+    /// Worst single-corner reprojection error, source-frame pixels.
+    pub fn residual_max_px(&self) -> f64 {
+        self.residual_max_px
+    }
+
+    /// Marker-corner correspondences fed to the estimator (4 or 8).
+    pub fn points_used(&self) -> u32 {
+        self.points_used
+    }
+
+    /// Correspondences the final model kept as inliers.
+    pub fn inliers(&self) -> u32 {
+        self.inliers
+    }
+}
+
+/// Full printed cell grid of a Reference Marker, row-major, 36 bytes,
+/// 1 = black cell. Debug/test surface: lets the page render a ground-truth
+/// marker (e.g. the browser smoke test's synthetic camera) from the same
+/// dictionary the detector matches against.
+#[wasm_bindgen]
+pub fn marker_pattern(id: u16) -> Option<Vec<u8>> {
+    marker::marker_cells(id).map(|cells| {
+        cells
+            .iter()
+            .flat_map(|row| row.iter().map(|&black| black as u8))
+            .collect()
+    })
 }
 
 /// Core version string, handy for the capture page to prove the module loaded.

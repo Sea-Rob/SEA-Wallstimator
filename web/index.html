@@ -69,6 +69,15 @@
     .result.warn { display: block; background: #3a2c14; border: 1px solid #a83; color: #fdb; }
     #overlay { display: none; max-width: 100%; background: #000; border-radius: 8px; margin-top: 0.75rem; }
     #overlay.live { display: block; }
+    #rectified {
+      display: block;
+      max-width: 100%;
+      background: #000;
+      border-radius: 8px;
+      margin-top: 0.75rem;
+      cursor: crosshair;
+      touch-action: manipulation;
+    }
     #error {
       display: none;
       margin: 1rem 0;
@@ -122,11 +131,25 @@
 
     <section id="step-capture">
       <h2>3 · Capture the wall</h2>
-      <p>Point the camera so a Reference Marker is in view, then pan slowly along the wall.</p>
+      <p>Point the camera so a Reference Marker is fully in view, then capture a frame.</p>
       <button id="start-capture" class="primary" disabled>Start camera</button>
+      <button id="capture-frame" class="primary" hidden>Capture frame</button>
       <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
       <video id="camera" playsinline muted hidden></video>
       <canvas id="overlay" width="640" height="480"></canvas>
+      <div id="capture-result" class="result" role="status"></div>
+    </section>
+
+    <section id="step-rectified" hidden>
+      <h2>4 · Rectified Wall Image — measure to check</h2>
+      <p>
+        The frame below is re-projected flat-on with a real millimetre scale.
+        Tap <strong>two points</strong> to measure the distance between them —
+        check it against a tape measure on the wall.
+      </p>
+      <canvas id="rectified"></canvas>
+      <div id="measure-result" class="result" role="status"></div>
+      <button id="clear-measure" hidden>Clear points</button>
     </section>
 
     <div id="error" role="alert"></div>
