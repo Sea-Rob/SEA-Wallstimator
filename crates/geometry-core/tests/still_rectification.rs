@@ -196,6 +196,7 @@ fn both_markers_in_frame_use_the_eight_point_path() {
     assert_eq!(r.marker_ids, vec![0, 1], "both Reference Markers must be used");
     assert_eq!(r.estimate.residuals.len(), 8, "8 correspondences");
     assert_eq!(r.estimate.inliers, 8);
+    assert!(!r.second_marker_rejected, "clean joint fit must not raise the flag");
     // Markers are ~95 px across in this wide two-marker view, so corner
     // noise is higher than the single-marker close-up.
     assert!(r.estimate.rms < 1.0, "rms {}", r.estimate.rms);
@@ -203,6 +204,57 @@ fn both_markers_in_frame_use_the_eight_point_path() {
     let measured = measure_dots_mm(&r, dot_a, dot_b);
     let err_pct = (measured - 300.0).abs() / 300.0 * 100.0;
     assert!(err_pct < 1.0, "two-marker measurement off by {err_pct:.2}%");
+}
+
+#[test]
+fn inconsistent_second_marker_falls_back_to_anchor_and_says_so() {
+    // Marker A lies on the wall plane; marker B is rendered through a very
+    // different projection — geometrically it cannot lie on A's plane (as if
+    // taped to a door swung open, or badly mis-detected). The joint fit must
+    // reject B, fall back to the anchor alone, and RAISE THE FLAG the UI
+    // shows the Homeowner (CONTEXT.md: no silent guessing).
+    let h_a = [
+        0.62, 0.03, 100.0, //
+        -0.02, 0.61, 60.0, //
+        1.0e-4, 0.7e-4, 1.0,
+    ];
+    // Strong aspect anisotropy (x-scale ~2x the y-scale) plus rotation: a
+    // rigid square through ANY plane homography that also fits A cannot
+    // reproduce this quad — the pose nuisance absorbs rotation/translation
+    // but never aspect.
+    let h_b = [
+        0.52, -0.30, 440.0, //
+        0.18, 0.26, 130.0, //
+        0.3e-4, 0.1e-4, 1.0,
+    ];
+    let scene_a = Scene { markers: vec![marker_at_origin(0, 150.0)], dots: vec![] };
+    let scene_b = Scene {
+        markers: vec![SyntheticMarker { id: 1, x_mm: 0.0, y_mm: 0.0, side_mm: 150.0, rot_quarter: 0 }],
+        dots: vec![],
+    };
+    let a = render_scene(&scene_a, &h_a, W, H, 2.0, 11);
+    let b = render_scene(&scene_b, &h_b, W, H, 2.0, 12);
+    // Composite: darker pixel wins (both renders are dark-on-white).
+    let rgba: Vec<u8> = a
+        .iter()
+        .zip(&b)
+        .enumerate()
+        .map(|(i, (&pa, &pb))| if i % 4 == 3 { 255 } else { pa.min(pb) })
+        .collect();
+
+    // Both markers really are in the frame.
+    let mut gray = vec![0u8; W * H];
+    grayscale(&rgba, &mut gray);
+    let detected = detect_markers(&gray, W, H);
+    assert_eq!(detected.len(), 2, "both markers must be detected in the composite");
+
+    let r = rectify_frame(&rgba, W, H, 1.0).expect("anchor still rectifies");
+    assert_eq!(r.marker_ids, vec![0], "must fall back to the anchor marker only");
+    assert_eq!(r.estimate.residuals.len(), 4, "single-marker 4-point fit");
+    assert!(
+        r.second_marker_rejected,
+        "discarding a visible second marker must be flagged, never silent"
+    );
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! it tracked correspondences between frames. Coordinates are unit-agnostic —
 //! the still path maps wall-plane millimetres to image pixels.
 
-use crate::linalg::{mat3_inv, mat3_mul, smallest_eigenvector_sym, solve_in_place};
+use crate::linalg::{mat3_inv, mat3_mul, smallest_eigenpair_sym, solve_in_place};
 
 /// A 3x3 planar homography, row-major.
 #[derive(Clone, Copy, Debug)]
@@ -89,7 +89,18 @@ pub fn dlt(src: &[[f64; 2]], dst: &[[f64; 2]]) -> Option<Homography> {
         add_row([0.0, 0.0, 0.0, -x, -y, -1.0, v * x, v * y, v]);
     }
 
-    let h_norm = smallest_eigenvector_sym(&mut ata, 9);
+    let trace: f64 = (0..9).map(|i| ata[i * 9 + i]).sum();
+    let (h_norm, _lambda_min, lambda_second) = smallest_eigenpair_sym(&mut ata, 9);
+    // Degenerate correspondence sets (e.g. 3+ collinear points) leave a
+    // multi-dimensional nullspace: the second-smallest eigenvalue is as tiny
+    // as the smallest, and the returned vector is an arbitrary nullspace
+    // element — a rank-deficient "H" that reprojects the input with
+    // deceptively perfect residuals. Reject when the second eigenvalue
+    // vanishes relative to the matrix scale (well-conditioned sets sit many
+    // orders of magnitude above this).
+    if lambda_second < 1e-12 * trace.max(f64::MIN_POSITIVE) {
+        return None;
+    }
     let mut hn = [0.0; 9];
     hn.copy_from_slice(&h_norm);
 
@@ -274,6 +285,7 @@ pub fn estimate(src: &[[f64; 2]], dst: &[[f64; 2]], inlier_threshold: f64) -> Op
     // RANSAC over minimal 4-point samples.
     let mut rng = Lcg(0x5EA_1157);
     let mut best_mask: Option<Vec<bool>> = None;
+    let mut best_h: Option<Homography> = None;
     let mut best_count = 0usize;
     for _ in 0..200 {
         let mut idx = [0usize; 4];
@@ -294,6 +306,7 @@ pub fn estimate(src: &[[f64; 2]], dst: &[[f64; 2]], inlier_threshold: f64) -> Op
         if count > best_count {
             best_count = count;
             best_mask = Some(mask);
+            best_h = Some(h);
             if count == n {
                 break;
             }
@@ -305,7 +318,10 @@ pub fn estimate(src: &[[f64; 2]], dst: &[[f64; 2]], inlier_threshold: f64) -> Op
     }
     let s: Vec<[f64; 2]> = (0..n).filter(|&i| mask[i]).map(|i| src[i]).collect();
     let d: Vec<[f64; 2]> = (0..n).filter(|&i| mask[i]).map(|i| dst[i]).collect();
-    let h = refine_lm(&dlt(&s, &d)?, &s, &d);
+    // If the full inlier set happens to be degenerate for DLT, fall back to
+    // the best minimal-sample model rather than failing the whole estimate.
+    let refit = dlt(&s, &d).or_else(|| best_h.take())?;
+    let h = refine_lm(&refit, &s, &d);
     Some(summarize(h, src, dst, best_count))
 }
 
@@ -392,15 +408,30 @@ mod tests {
 
     #[test]
     fn estimate_rejects_degenerate_input() {
-        // Collinear points admit no unique homography.
+        // All four points collinear: the DLT nullspace is multi-dimensional
+        // and any returned "solution" would be rank-deficient garbage with
+        // deceptively perfect residuals. Must be rejected outright.
         let src = vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]];
         let dst = src.clone();
-        assert!(dlt(&src, &dst).is_none() || {
-            // If DLT numerically returns something, estimate must still
-            // produce enormous residuals for a probe point — accept either.
-            true
-        });
+        assert!(dlt(&src, &dst).is_none(), "collinear 4-point set must be rejected");
+        assert!(estimate(&src, &dst, 3.0).is_none(), "estimate must reject it too");
+
+        // Three collinear out of four is equally degenerate.
+        let src3 = vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [1.0, 5.0]];
+        let dst3 = src3.clone();
+        assert!(dlt(&src3, &dst3).is_none(), "3-collinear set must be rejected");
+
+        // Near-collinear (points off the line by ~1e-9) is numerically the
+        // same trap.
+        let src_near = vec![[0.0, 0.0], [1.0, 1e-9], [2.0, -1e-9], [3.0, 0.0]];
+        assert!(dlt(&src_near, &src_near).is_none(), "near-collinear must be rejected");
+
         assert!(estimate(&src[..3], &dst[..3], 3.0).is_none(), "under-determined");
+
+        // Sanity: a well-conditioned square still passes after the new gate.
+        let ok_src = square_mm();
+        let ok_dst: Vec<[f64; 2]> = ok_src.iter().map(|&p| apply_true(&H_TRUE, p)).collect();
+        assert!(dlt(&ok_src, &ok_dst).is_some(), "well-conditioned set must survive");
     }
 
     #[test]

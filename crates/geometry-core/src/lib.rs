@@ -200,6 +200,7 @@ pub struct RectifiedWallImage {
     origin_x_mm: f64,
     origin_y_mm: f64,
     marker_ids: Vec<u16>,
+    second_marker_rejected: bool,
     residual_rms_px: f64,
     residual_max_px: f64,
     points_used: u32,
@@ -216,6 +217,7 @@ impl RectifiedWallImage {
             origin_x_mm: r.origin_mm[0],
             origin_y_mm: r.origin_mm[1],
             marker_ids: r.marker_ids,
+            second_marker_rejected: r.second_marker_rejected,
             residual_rms_px: r.estimate.rms,
             residual_max_px: r.estimate.max,
             points_used: r.estimate.residuals.len() as u32,
@@ -262,6 +264,13 @@ impl RectifiedWallImage {
     /// IDs of the Reference Markers used for the estimate, anchor first.
     pub fn marker_ids(&self) -> Vec<u16> {
         self.marker_ids.clone()
+    }
+
+    /// True when a second marker was detected but its constraint was
+    /// discarded (bad detection or inconsistent joint fit): the result
+    /// degraded to single-marker extrapolation and the page must say so.
+    pub fn second_marker_rejected(&self) -> bool {
+        self.second_marker_rejected
     }
 
     /// RMS reprojection error of the marker corners under the estimated

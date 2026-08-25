@@ -36,6 +36,11 @@ pub struct Rectified {
     pub origin_mm: [f64; 2],
     /// IDs of the markers used, anchor first.
     pub marker_ids: Vec<u16>,
+    /// True when a second marker was detected in the frame but its
+    /// constraint had to be discarded (implausible back-projection or an
+    /// inconsistent joint fit) — the result silently degraded to
+    /// single-marker extrapolation, which the UI must surface.
+    pub second_marker_rejected: bool,
     /// Homography estimate (wall mm -> source px) with residuals.
     pub estimate: Estimate,
 }
@@ -67,12 +72,12 @@ fn anchor_corners_mm(side_mm: f64) -> [[f64; 2]; 4] {
 fn estimate_wall_homography(
     markers: &[DetectedMarker],
     side_mm: f64,
-) -> Option<(Estimate, Vec<u16>)> {
+) -> Option<(Estimate, Vec<u16>, bool)> {
     let anchor = markers.first()?;
     let world = anchor_corners_mm(side_mm);
     let anchor_est = estimate(&world, &anchor.corners, INLIER_THRESHOLD_PX)?;
     if markers.len() == 1 {
-        return Some((anchor_est, vec![anchor.id]));
+        return Some((anchor_est, vec![anchor.id], false));
     }
 
     // The second marker's wall pose (translation + rotation on the plane) is
@@ -95,8 +100,9 @@ fn estimate_wall_homography(
             let (x, y) = h_inv.apply(c[0], c[1])?;
             if x.abs() > MAX_EXTENT_MM * 2.0 || y.abs() > MAX_EXTENT_MM * 2.0 {
                 // Second marker back-projects implausibly far — likely a
-                // bad detection; fall back to the anchor alone.
-                return Some((anchor_est, vec![anchor.id]));
+                // bad detection; fall back to the anchor alone, flagged so
+                // the UI can say so (CONTEXT.md: we don't guess silently).
+                return Some((anchor_est, vec![anchor.id], true));
             }
             plane_pts[i] = [x, y];
         }
@@ -117,8 +123,8 @@ fn estimate_wall_homography(
         }
     }
     match best {
-        Some(est) => Some((est, vec![anchor.id, second.id])),
-        None => Some((anchor_est, vec![anchor.id])),
+        Some(est) => Some((est, vec![anchor.id, second.id], false)),
+        None => Some((anchor_est, vec![anchor.id], true)),
     }
 }
 
@@ -191,7 +197,8 @@ pub fn rectify_frame(
     markers.sort_by_key(|m| m.id);
 
     let side_mm = MARKER_SIDE_MM * correction_factor;
-    let (est, marker_ids) = estimate_wall_homography(&markers, side_mm)?;
+    let (est, marker_ids, second_marker_rejected) =
+        estimate_wall_homography(&markers, side_mm)?;
     let h_inv = est.h.inverse()?;
 
     // Output extent: back-project the frame corners onto the wall plane,
@@ -235,6 +242,7 @@ pub fn rectify_frame(
         mm_per_px,
         origin_mm: [min_x, min_y],
         marker_ids,
+        second_marker_rejected,
         estimate: est,
     })
 }

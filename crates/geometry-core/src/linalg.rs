@@ -45,6 +45,15 @@ pub fn mat3_inv(m: &[f64; 9]) -> Option<[f64; 9]> {
 /// Eigenvector for the smallest eigenvalue of a symmetric `n`x`n` row-major
 /// matrix (`n` <= 9), via cyclic Jacobi rotations. `a` is destroyed.
 pub fn smallest_eigenvector_sym(a: &mut [f64], n: usize) -> Vec<f64> {
+    smallest_eigenpair_sym(a, n).0
+}
+
+/// Like [`smallest_eigenvector_sym`] but also returns the smallest and
+/// second-smallest eigenvalues. A near-zero gap between them means the
+/// nullspace is (numerically) multi-dimensional — for DLT, that is a
+/// degenerate correspondence set (e.g. collinear points) whose returned
+/// "solution" is an arbitrary vector of the nullspace, not a homography.
+pub fn smallest_eigenpair_sym(a: &mut [f64], n: usize) -> (Vec<f64>, f64, f64) {
     debug_assert!(a.len() == n * n && n >= 1 && n <= 9);
     // v starts as identity; columns accumulate the eigenvectors.
     let mut v = vec![0.0; n * n];
@@ -100,7 +109,14 @@ pub fn smallest_eigenvector_sym(a: &mut [f64], n: usize) -> Vec<f64> {
             min_i = i;
         }
     }
-    (0..n).map(|k| v[k * n + min_i]).collect()
+    let mut second = f64::INFINITY;
+    for i in 0..n {
+        if i != min_i {
+            second = second.min(a[i * n + i]);
+        }
+    }
+    let vec = (0..n).map(|k| v[k * n + min_i]).collect();
+    (vec, a[min_i * n + min_i], second)
 }
 
 /// Solve `a * x = b` in place for a small `n`x`n` system via Gaussian

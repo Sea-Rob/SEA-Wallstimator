@@ -262,9 +262,12 @@ async function startCapture(wasm, version, isolated) {
         `${width}×${height} @ ${fps.toFixed(1)} fps`,
       ];
       if (session.rectified) {
+        const quality =
+          session.rectified.pointsUsed > 4
+            ? `residual RMS ${session.rectified.residualRmsPx.toFixed(2)} px`
+            : "exact fit";
         parts.push(
-          `rectified ${session.rectified.mmPerPx.toFixed(2)} mm/px, ` +
-            `residual RMS ${session.rectified.residualRmsPx.toFixed(2)} px`,
+          `rectified ${session.rectified.mmPerPx.toFixed(2)} mm/px, ${quality}`,
         );
       }
       setStatus(parts);
@@ -389,11 +392,13 @@ function captureFrame(wasm, processor) {
     rectified.points = [];
 
     const markerIds = Array.from(image.marker_ids());
+    const secondMarkerRejected = image.second_marker_rejected();
     const meta = recordRectifiedWallImage({
       widthPx: width,
       heightPx: height,
       mmPerPx: rectified.mmPerPx,
       markerIds,
+      secondMarkerRejected,
       residualRmsPx: image.residual_rms_px(),
       residualMaxPx: image.residual_max_px(),
       pointsUsed: image.points_used(),
@@ -404,14 +409,29 @@ function captureFrame(wasm, processor) {
     rectifiedSection.hidden = false;
     updateMeasureReadout();
     const markerNames = markerIds.map((id) => (id === 0 ? "A" : "B")).join(" + ");
+    // With one marker the 4-point fit is exact by construction: a residual
+    // of 0.00 px says nothing about capture quality, so don't present it as
+    // if it did.
+    const quality =
+      meta.pointsUsed > 4
+        ? `corner reprojection RMS ${meta.residualRmsPx.toFixed(2)} px ` +
+          `(max ${meta.residualMaxPx.toFixed(2)} px, ${meta.inliers}/${meta.pointsUsed} corners)`
+        : "single-marker exact fit (4 corners; no redundancy to score quality)";
     showCaptureResult(
       "ok",
       `Rectified Wall Image rendered from marker ${markerNames}: ` +
-        `${width}×${height} px at ${rectified.mmPerPx.toFixed(2)} mm/px, ` +
-        `corner reprojection RMS ${meta.residualRmsPx.toFixed(2)} px ` +
-        `(max ${meta.residualMaxPx.toFixed(2)} px, ${meta.inliers}/${meta.pointsUsed} corners). ` +
+        `${width}×${height} px at ${rectified.mmPerPx.toFixed(2)} mm/px, ${quality}. ` +
         "Scroll down to measure.",
     );
+    if (secondMarkerRejected) {
+      showCaptureResult(
+        "warn",
+        "A second Reference Marker was visible but could not be used " +
+          "(poor detection or inconsistent fit) — measurements far from " +
+          `marker ${markerNames} are less accurate. Re-capture with both ` +
+          "markers sharp and fully in view if possible.",
+      );
+    }
     rectifiedSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } finally {
     image.free(); // pixels were copied out; release the WASM-side buffer
