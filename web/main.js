@@ -21,7 +21,12 @@ import init, {
   ruler_nominal_mm,
 } from "./pkg/geometry_core.js";
 import { evaluateRulerMeasurement } from "./print-scale.js";
-import { session, recordPrintScale, hasVerifiedPrintScale } from "./session.js";
+import {
+  session,
+  recordPrintScale,
+  hasVerifiedPrintScale,
+  lockForCapture,
+} from "./session.js";
 
 // Processing resolution: enough to see edges, cheap enough for a mid-range
 // phone on the CPU-only skeleton path (GPU preprocessing comes later).
@@ -84,7 +89,19 @@ function handleMeasurement(measuredMm, nominalMm) {
     return;
   }
 
-  recordPrintScale({ measuredMm, nominalMm, correctionFactor: verdict.correctionFactor });
+  const stored = recordPrintScale({
+    measuredMm,
+    nominalMm,
+    correctionFactor: verdict.correctionFactor,
+  });
+  if (!stored) {
+    showScaleResult(
+      "warn",
+      "Capture has already started, so this session's print scale is locked. " +
+        "Reload the page to start over with a new measurement.",
+    );
+    return;
+  }
   const deviation =
     Math.abs(verdict.deviationPercent) < 0.05
       ? "no print scaling detected"
@@ -149,6 +166,13 @@ async function startCapture(wasm, version, isolated) {
   video.srcObject = stream;
   await video.play();
   overlay.classList.add("live");
+
+  // One session, one correction factor: freeze the print-scale record and
+  // grey out the step-2 controls once frames are flowing.
+  lockForCapture();
+  confirmBtn.disabled = true;
+  exactBtn.disabled = true;
+  measuredInput.disabled = true;
 
   // Size everything from the actual camera resolution, downscaled for the CPU.
   const scale = Math.min(1, PROC_WIDTH / video.videoWidth);
