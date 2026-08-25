@@ -20,16 +20,59 @@
     header { padding: 0.75rem 1rem; text-align: center; }
     h1 { font-size: 1.1rem; margin: 0; }
     #status { font-size: 0.8rem; color: #9a9; margin-top: 0.25rem; }
-    #overlay {
-      max-width: 100%;
-      background: #000;
+    main { width: min(34rem, calc(100vw - 2rem)); padding-bottom: 2rem; }
+    section {
+      margin: 0.75rem 0;
+      padding: 1rem;
+      background: #1a1a1a;
+      border: 1px solid #333;
       border-radius: 8px;
     }
+    section h2 { font-size: 0.95rem; margin: 0 0 0.5rem; }
+    section p { font-size: 0.85rem; line-height: 1.45; margin: 0.4rem 0; color: #ccc; }
+    .print-warning { color: #fc6; }
+    a.download {
+      display: inline-block;
+      margin-top: 0.4rem;
+      padding: 0.55rem 0.9rem;
+      background: #264;
+      color: #dfd;
+      border: 1px solid #486;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    label { display: block; font-size: 0.85rem; margin: 0.6rem 0 0.25rem; }
+    input[type="number"] {
+      width: 7rem;
+      padding: 0.45rem;
+      font-size: 1rem;
+      background: #222;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 6px;
+    }
+    button {
+      margin: 0.5rem 0.5rem 0 0;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.9rem;
+      background: #333;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button.primary { background: #264; border-color: #486; color: #dfd; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .result { display: none; margin-top: 0.75rem; padding: 0.7rem; border-radius: 6px; font-size: 0.85rem; }
+    .result.ok { display: block; background: #143a1e; border: 1px solid #3a4; color: #bfb; }
+    .result.warn { display: block; background: #3a2c14; border: 1px solid #a83; color: #fdb; }
+    #overlay { display: none; max-width: 100%; background: #000; border-radius: 8px; margin-top: 0.75rem; }
+    #overlay.live { display: block; }
     #error {
       display: none;
-      margin: 1rem;
+      margin: 1rem 0;
       padding: 1rem;
-      max-width: 32rem;
       background: #3a1414;
       border: 1px solid #a33;
       border-radius: 8px;
@@ -40,13 +83,54 @@
 </head>
 <body>
   <header>
-    <h1>Wallstimator capture — walking skeleton</h1>
+    <h1>Wallstimator capture</h1>
     <div id="status">loading…</div>
   </header>
-  <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
-  <video id="camera" playsinline muted hidden></video>
-  <canvas id="overlay" width="640" height="480"></canvas>
-  <div id="error" role="alert"></div>
+  <main>
+    <section id="step-print">
+      <h2>1 · Print the Reference Markers</h2>
+      <p>
+        Download the two-page PDF and print both pages on A4. Tape page 1
+        (Marker A) at the <strong>left</strong> end of the wall area and page 2
+        (Marker B) at the <strong>right</strong> end, flat against the wall.
+      </p>
+      <p class="print-warning">
+        Print at <strong>100% / actual size</strong> — do not use “fit to page”.
+        (If your printer rescaled anyway, the next step corrects for it.)
+      </p>
+      <a id="pdf-link" class="download" href="reference-marker.pdf" download>
+        Download Reference Marker PDF (2 pages, A4)
+      </a>
+    </section>
+
+    <section id="step-scale">
+      <h2>2 · Verify print scale</h2>
+      <p>
+        With a tape measure, measure the ruler strip on a printed page from the
+        0 mark to the <span class="nominal-mm">…</span> mm mark, and enter what
+        you read — this catches printers that silently rescale.
+      </p>
+      <label for="measured-mm">Measured length (mm)</label>
+      <input id="measured-mm" type="number" inputmode="decimal" min="0" step="0.5"
+             placeholder="e.g. 200" />
+      <div>
+        <button id="confirm-measure" class="primary" disabled>Confirm measurement</button>
+        <button id="exact-nominal" disabled>It measures exactly <span class="nominal-mm">…</span> mm</button>
+      </div>
+      <div id="scale-result" class="result" role="status"></div>
+    </section>
+
+    <section id="step-capture">
+      <h2>3 · Capture the wall</h2>
+      <p>Point the camera so a Reference Marker is in view, then pan slowly along the wall.</p>
+      <button id="start-capture" class="primary" disabled>Start camera</button>
+      <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
+      <video id="camera" playsinline muted hidden></video>
+      <canvas id="overlay" width="640" height="480"></canvas>
+    </section>
+
+    <div id="error" role="alert"></div>
+  </main>
   <script type="module" src="./main.js"></script>
 </body>
 </html>

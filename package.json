@@ -6,8 +6,10 @@
   "type": "module",
   "scripts": {
     "build:wasm": "wasm-pack build crates/geometry-core --release --target web --out-dir ../../web/pkg --no-pack && wasm-opt -Os --enable-bulk-memory --enable-nontrapping-float-to-int web/pkg/geometry_core_bg.wasm -o web/pkg/geometry_core_bg.wasm",
+    "build:pdf": "cargo run -p marker-pdf",
     "dev": "npm run build:wasm && node web/server.mjs",
     "serve": "node web/server.mjs",
-    "test": "cargo test --workspace"
+    "test": "cargo test --workspace && npm run test:js",
+    "test:js": "node --test web/test/*.test.mjs"
   }
 }
