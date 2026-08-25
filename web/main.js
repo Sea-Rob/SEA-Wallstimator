@@ -24,6 +24,7 @@ import { evaluateRulerMeasurement } from "./print-scale.js";
 import {
   session,
   recordPrintScale,
+  recordRectifiedWallImage,
   hasVerifiedPrintScale,
   lockForCapture,
 } from "./session.js";
@@ -43,6 +44,13 @@ const confirmBtn = document.getElementById("confirm-measure");
 const exactBtn = document.getElementById("exact-nominal");
 const scaleResult = document.getElementById("scale-result");
 const startCaptureBtn = document.getElementById("start-capture");
+const captureFrameBtn = document.getElementById("capture-frame");
+const captureResult = document.getElementById("capture-result");
+const rectifiedSection = document.getElementById("step-rectified");
+const rectifiedCanvas = document.getElementById("rectified");
+const rectifiedCtx = rectifiedCanvas.getContext("2d");
+const measureResult = document.getElementById("measure-result");
+const clearMeasureBtn = document.getElementById("clear-measure");
 
 // Debug / test handle: lets DevTools (and smoke tests) inspect session state.
 window.wallstimatorSession = session;
@@ -190,6 +198,20 @@ async function startCapture(wasm, version, isolated) {
   const processor = new FrameProcessor(width, height);
   const frameLen = processor.frame_len();
 
+  // The render loop below keeps the latest frame in the WASM input buffer,
+  // so "Capture frame" simply runs the still path on whatever is there.
+  captureFrameBtn.hidden = false;
+  captureFrameBtn.addEventListener("click", () => {
+    try {
+      captureFrame(wasm, processor);
+    } catch (err) {
+      showCaptureResult(
+        "warn",
+        "Rectification failed: " + (err && err.message ? err.message : String(err)),
+      );
+    }
+  });
+
   let frames = 0;
   let fpsWindowStart = performance.now();
 
@@ -233,17 +255,167 @@ async function startCapture(wasm, version, isolated) {
       const correction = session.printScale
         ? `print scale ×${session.printScale.correctionFactor.toFixed(4)}`
         : "print scale unverified";
-      setStatus([
+      const parts = [
         `geometry-core v${version}`,
         `crossOriginIsolated: ${isolated}`,
         correction,
         `${width}×${height} @ ${fps.toFixed(1)} fps`,
-      ]);
+      ];
+      if (session.rectified) {
+        parts.push(
+          `rectified ${session.rectified.mmPerPx.toFixed(2)} mm/px, ` +
+            `residual RMS ${session.rectified.residualRmsPx.toFixed(2)} px`,
+        );
+      }
+      setStatus(parts);
       frames = 0;
       fpsWindowStart = now;
     }
   }
   requestAnimationFrame(renderLoop);
+}
+
+// ---------------------------------------------------------------------------
+// Step 4 — Rectified Wall Image + two-point measure tool (issue #3).
+
+// State of the currently displayed Rectified Wall Image.
+const rectified = {
+  imageData: null, // base pixels, redrawn under the measure overlay
+  mmPerPx: 0,
+  points: [], // up to two [x, y] in canvas px
+};
+
+function showCaptureResult(kind, message) {
+  captureResult.className = `result ${kind}`;
+  captureResult.textContent = message;
+}
+
+/** Canvas-pixel coordinates of a pointer event (canvas is CSS-scaled). */
+function canvasPoint(canvas, event) {
+  const r = canvas.getBoundingClientRect();
+  return [
+    ((event.clientX - r.left) / r.width) * canvas.width,
+    ((event.clientY - r.top) / r.height) * canvas.height,
+  ];
+}
+
+function drawMeasureOverlay() {
+  rectifiedCtx.putImageData(rectified.imageData, 0, 0);
+  const px = Math.max(2, rectifiedCanvas.width / 240);
+  rectifiedCtx.lineWidth = px / 2;
+  rectifiedCtx.strokeStyle = "#ff5252";
+  rectifiedCtx.fillStyle = "#ff5252";
+  for (const [x, y] of rectified.points) {
+    rectifiedCtx.beginPath();
+    rectifiedCtx.moveTo(x - 3 * px, y);
+    rectifiedCtx.lineTo(x + 3 * px, y);
+    rectifiedCtx.moveTo(x, y - 3 * px);
+    rectifiedCtx.lineTo(x, y + 3 * px);
+    rectifiedCtx.stroke();
+  }
+  if (rectified.points.length === 2) {
+    const [[x1, y1], [x2, y2]] = rectified.points;
+    rectifiedCtx.beginPath();
+    rectifiedCtx.moveTo(x1, y1);
+    rectifiedCtx.lineTo(x2, y2);
+    rectifiedCtx.stroke();
+  }
+}
+
+function updateMeasureReadout() {
+  if (rectified.points.length < 2) {
+    measureResult.className = "result ok";
+    measureResult.textContent =
+      rectified.points.length === 0
+        ? "Tap the first point on the image."
+        : "Tap the second point to measure.";
+    return;
+  }
+  const [[x1, y1], [x2, y2]] = rectified.points;
+  const distMm = Math.hypot(x2 - x1, y2 - y1) * rectified.mmPerPx;
+  measureResult.className = "result ok";
+  measureResult.textContent =
+    `Distance: ${distMm.toFixed(1)} mm (${(distMm / 10).toFixed(1)} cm). ` +
+    "Check it against your tape measure. Tap again to restart.";
+}
+
+function clearMeasurePoints() {
+  rectified.points = [];
+  if (rectified.imageData) drawMeasureOverlay();
+  updateMeasureReadout();
+}
+
+function wireMeasureTool() {
+  rectifiedCanvas.addEventListener("pointerdown", (event) => {
+    if (!rectified.imageData) return;
+    event.preventDefault();
+    if (rectified.points.length >= 2) rectified.points = [];
+    rectified.points.push(canvasPoint(rectifiedCanvas, event));
+    drawMeasureOverlay();
+    updateMeasureReadout();
+    clearMeasureBtn.hidden = false;
+  });
+  clearMeasureBtn.addEventListener("click", clearMeasurePoints);
+}
+
+/**
+ * Run the still-frame path on the frame currently in the WASM input buffer:
+ * detect Reference Marker(s), estimate the wall homography, render the
+ * Rectified Wall Image, and show it with the measure tool armed.
+ */
+function captureFrame(wasm, processor) {
+  const correctionFactor = session.printScale.correctionFactor;
+  const image = processor.rectify_captured(correctionFactor);
+  if (!image) {
+    showCaptureResult(
+      "warn",
+      "No Reference Marker found in that frame. Get the whole marker (black " +
+        "square and white border) sharply in view and capture again.",
+    );
+    return;
+  }
+  try {
+    const width = image.width();
+    const height = image.height();
+    const pixels = new Uint8ClampedArray(
+      wasm.memory.buffer,
+      image.pixels_ptr(),
+      image.pixels_len(),
+    );
+    rectifiedCanvas.width = width;
+    rectifiedCanvas.height = height;
+    rectified.imageData = new ImageData(pixels.slice(), width, height);
+    rectified.mmPerPx = image.mm_per_px();
+    rectified.points = [];
+
+    const markerIds = Array.from(image.marker_ids());
+    const meta = recordRectifiedWallImage({
+      widthPx: width,
+      heightPx: height,
+      mmPerPx: rectified.mmPerPx,
+      markerIds,
+      residualRmsPx: image.residual_rms_px(),
+      residualMaxPx: image.residual_max_px(),
+      pointsUsed: image.points_used(),
+      inliers: image.inliers(),
+    });
+
+    drawMeasureOverlay();
+    rectifiedSection.hidden = false;
+    updateMeasureReadout();
+    const markerNames = markerIds.map((id) => (id === 0 ? "A" : "B")).join(" + ");
+    showCaptureResult(
+      "ok",
+      `Rectified Wall Image rendered from marker ${markerNames}: ` +
+        `${width}×${height} px at ${rectified.mmPerPx.toFixed(2)} mm/px, ` +
+        `corner reprojection RMS ${meta.residualRmsPx.toFixed(2)} px ` +
+        `(max ${meta.residualMaxPx.toFixed(2)} px, ${meta.inliers}/${meta.pointsUsed} corners). ` +
+        "Scroll down to measure.",
+    );
+    rectifiedSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } finally {
+    image.free(); // pixels were copied out; release the WASM-side buffer
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +438,7 @@ async function main() {
   // Nominal ruler length comes from geometry-core: the same source of truth
   // the PDF was generated from, so page copy can never drift from the print.
   wireScaleStep(ruler_nominal_mm());
+  wireMeasureTool();
 
   startCaptureBtn.addEventListener("click", () => {
     if (!hasVerifiedPrintScale()) return; // button is disabled anyway
