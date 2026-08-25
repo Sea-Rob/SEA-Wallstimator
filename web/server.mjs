@@ -22,6 +22,14 @@ const MIME = {
   ".ts": "text/plain; charset=utf-8",
 };
 
+// Cross-origin isolation on every response (404s included, for consistency
+// with the "same headers on these routes" production guidance above).
+const ISOLATION_HEADERS = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+  "Cache-Control": "no-store",
+};
+
 const server = createServer(async (req, res) => {
   const urlPath = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
   const relative = normalize(urlPath).replace(/^([/\\.])+/, "");
@@ -31,14 +39,11 @@ const server = createServer(async (req, res) => {
     const body = await readFile(filePath);
     res.writeHead(200, {
       "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
-      // Cross-origin isolation: required for SharedArrayBuffer / WASM threads.
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp",
-      "Cache-Control": "no-store",
+      ...ISOLATION_HEADERS,
     });
     res.end(body);
   } catch {
-    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.writeHead(404, { "Content-Type": "text/plain", ...ISOLATION_HEADERS });
     res.end("Not found");
   }
 });

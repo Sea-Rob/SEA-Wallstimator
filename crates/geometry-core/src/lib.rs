@@ -7,7 +7,8 @@
 //! The capture page writes camera frames (RGBA) directly into WASM memory via
 //! [`FrameProcessor::input_ptr`], calls [`FrameProcessor::process`], and reads
 //! the visibly-processed overlay back out via [`FrameProcessor::output_ptr`].
-//! No per-frame allocation, no per-frame copies through wasm-bindgen.
+//! No per-frame allocation or marshalling copies across the wasm-bindgen
+//! boundary itself (the JS side still copies pixels in and out of its canvases).
 
 use wasm_bindgen::prelude::*;
 
@@ -78,6 +79,15 @@ pub fn compose_overlay(gray: &[u8], edges: &[u8], rgba_out: &mut [u8]) {
     }
 }
 
+/// Pixel count for a `width` x `height` frame, or `None` if either dimension
+/// is zero or the RGBA byte length (`w * h * 4`) would overflow `usize`
+/// (which is 32-bit on wasm32).
+fn checked_frame_pixels(width: u32, height: u32) -> Option<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .filter(|&n| n > 0 && n.checked_mul(4).is_some())
+}
+
 /// Fixed-size frame processor owning all buffers on the WASM side.
 #[wasm_bindgen]
 pub struct FrameProcessor {
@@ -92,18 +102,21 @@ pub struct FrameProcessor {
 #[wasm_bindgen]
 impl FrameProcessor {
     /// Allocate a processor for `width` x `height` RGBA frames.
+    ///
+    /// Rejects zero or overflowing dimensions: a panic here would trap and
+    /// kill the WASM instance, so invalid sizes surface as a JS error instead.
     #[wasm_bindgen(constructor)]
-    pub fn new(width: u32, height: u32) -> FrameProcessor {
-        let (w, h) = (width as usize, height as usize);
-        let n = w * h;
-        FrameProcessor {
-            width: w,
-            height: h,
+    pub fn new(width: u32, height: u32) -> Result<FrameProcessor, JsError> {
+        let n = checked_frame_pixels(width, height)
+            .ok_or_else(|| JsError::new("invalid frame dimensions"))?;
+        Ok(FrameProcessor {
+            width: width as usize,
+            height: height as usize,
             input_rgba: vec![0; n * 4],
             gray: vec![0; n],
             edges: vec![0; n],
             output_rgba: vec![0; n * 4],
-        }
+        })
     }
 
     /// Pointer into WASM memory where the capture page writes the next
@@ -187,8 +200,17 @@ mod tests {
     }
 
     #[test]
+    fn frame_dimensions_are_validated() {
+        assert_eq!(checked_frame_pixels(8, 5), Some(40));
+        assert_eq!(checked_frame_pixels(0, 5), None);
+        assert_eq!(checked_frame_pixels(8, 0), None);
+        // w * h * 4 must not overflow usize (32-bit on wasm32).
+        assert_eq!(checked_frame_pixels(u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
     fn frame_processor_round_trips_a_frame() {
-        let mut fp = FrameProcessor::new(8, 5);
+        let mut fp = FrameProcessor::new(8, 5).expect("valid dimensions");
         assert_eq!(fp.frame_len(), 8 * 5 * 4);
         // Fill input: left half black, right half white.
         for y in 0..5 {

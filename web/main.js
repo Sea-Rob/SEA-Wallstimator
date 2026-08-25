@@ -89,6 +89,22 @@ async function main() {
   let fpsWindowStart = performance.now();
 
   function renderLoop() {
+    // A throw here (e.g. a WASM trap in process()) is outside main()'s catch;
+    // without this guard the overlay would freeze with no visible error.
+    try {
+      renderFrame();
+    } catch (err) {
+      showError(
+        "Frame processing stopped: " +
+          (err && err.message ? err.message : String(err)) +
+          " — reload the page.",
+      );
+      return;
+    }
+    requestAnimationFrame(renderLoop);
+  }
+
+  function renderFrame() {
     grabCtx.drawImage(video, 0, 0, width, height);
     const frame = grabCtx.getImageData(0, 0, width, height);
 
@@ -117,7 +133,6 @@ async function main() {
       frames = 0;
       fpsWindowStart = now;
     }
-    requestAnimationFrame(renderLoop);
   }
   requestAnimationFrame(renderLoop);
 }
