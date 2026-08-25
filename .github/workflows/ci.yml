@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Gzipped geometry-core budget (bytes). ADR-0001: tens-to-low-hundreds of KB.
+  WASM_GZIP_BUDGET: 307200
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack and binaryen
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          sudo apt-get update -q && sudo apt-get install -y -q binaryen
+
+      - name: Run geometry-core unit tests
+        run: cargo test --workspace
+
+      - name: Build WASM bundle
+        run: npm run build:wasm
+
+      - name: Report gzipped WASM size and enforce budget
+        run: |
+          WASM=web/pkg/geometry_core_bg.wasm
+          RAW=$(wc -c < "$WASM")
+          GZ=$(gzip -9 -c "$WASM" | wc -c)
+          {
+            echo "### geometry-core WASM bundle size"
+            echo ""
+            echo "| | bytes | KiB |"
+            echo "|---|---|---|"
+            echo "| raw | $RAW | $((RAW / 1024)) |"
+            echo "| gzipped | $GZ | $((GZ / 1024)) |"
+            echo ""
+            echo "Budget (gzipped): $WASM_GZIP_BUDGET bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "raw: $RAW bytes, gzipped: $GZ bytes (budget: $WASM_GZIP_BUDGET)"
+          if [ "$GZ" -gt "$WASM_GZIP_BUDGET" ]; then
+            echo "::error::Gzipped WASM ($GZ bytes) exceeds budget ($WASM_GZIP_BUDGET bytes)"
+            exit 1
+          fi

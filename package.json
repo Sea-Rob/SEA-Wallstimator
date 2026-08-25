@@ -1,0 +1,13 @@
+{
+  "name": "wallstimator",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Wallstimator web shell: capture page + geometry-core WASM build.",
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build crates/geometry-core --release --target web --out-dir ../../web/pkg --no-pack && wasm-opt -Os --enable-bulk-memory --enable-nontrapping-float-to-int web/pkg/geometry_core_bg.wasm -o web/pkg/geometry_core_bg.wasm",
+    "dev": "npm run build:wasm && node web/server.mjs",
+    "serve": "node web/server.mjs",
+    "test": "cargo test --workspace"
+  }
+}
