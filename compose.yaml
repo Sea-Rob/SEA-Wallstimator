@@ -1,0 +1,68 @@
+# Wallstimator: everything runs in containers (host needs only Docker).
+#
+#   docker compose up web --build      # build the WASM core + serve on :8787
+#   docker compose run --rm test-rust  # cargo test --workspace
+#   docker compose run --rm test-js    # node --test (JS unit tests)
+#   docker compose run --rm build-wasm # write web/pkg into the working tree
+#                                      # (for the bind-mounted `dev` server)
+#   docker compose up dev              # serve the working tree live on :8787
+#
+# The named cargo volumes keep Rust rebuilds incremental across runs.
+
+services:
+  # Self-contained: builds the WASM bundle inside the image, then serves it.
+  web:
+    build:
+      context: .
+      target: serve
+    ports:
+      - "8787:8787"
+
+  # Dev helpers (bind-mount the working tree; toolchain image, no host tools).
+  test-rust:
+    build:
+      context: .
+      target: toolchain
+    profiles: ["dev"]
+    working_dir: /work
+    volumes:
+      - .:/work
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/work/target
+    command: cargo test --workspace
+
+  test-js:
+    image: node:24-slim
+    profiles: ["dev"]
+    working_dir: /work
+    volumes:
+      - .:/work
+    command: npm run test:js
+
+  build-wasm:
+    build:
+      context: .
+      target: toolchain
+    profiles: ["dev"]
+    working_dir: /work
+    volumes:
+      - .:/work
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/work/target
+    command: npm run build:wasm
+
+  dev:
+    image: node:24-slim
+    profiles: ["dev"]
+    working_dir: /work
+    volumes:
+      - .:/work
+    environment:
+      PORT: "8787"
+    ports:
+      - "8787:8787"
+    command: node web/server.mjs
+
+volumes:
+  cargo-registry:
+  cargo-target:

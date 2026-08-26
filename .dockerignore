@@ -1,0 +1,7 @@
+.git
+.claude
+target
+web/pkg
+node_modules
+Dockerfile
+compose.yaml
