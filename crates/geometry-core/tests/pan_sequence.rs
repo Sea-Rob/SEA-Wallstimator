@@ -12,7 +12,7 @@
 //!   keyframes processed open-loop,
 //! * an untrackable segment breaks the chain loudly, naming the segment.
 
-use geometry_core::pan::{PanCore, PanError, PanOutput};
+use geometry_core::pan::{PanCore, PanError, PanOutput, MAX_CLOSURE_DISCREPANCY_MM};
 use geometry_core::synthetic::{render_scene, PanCamera, Scene, SyntheticMarker};
 
 const W: usize = 640;
@@ -136,8 +136,11 @@ fn pan_recovers_known_distances_within_the_reported_error_bound() {
     );
     assert!(!out.truncated);
     let closure = out.closure.as_ref().expect("Marker B must close the loop");
+    assert!(!out.closure_rejected, "clean closure must not be rejected");
+    // Same constant the production plausibility guard enforces: the test's
+    // notion of "implausible" can never drift from the shipping one.
     assert!(
-        closure.discrepancy_mm < 50.0,
+        closure.discrepancy_mm < MAX_CLOSURE_DISCREPANCY_MM,
         "implausible measured drift: {} mm",
         closure.discrepancy_mm
     );
@@ -172,7 +175,10 @@ fn pan_recovers_known_distances_within_the_reported_error_bound() {
     );
     for (name, a, b, true_mm) in cases {
         let measured = measure_mm(&out, a, b, 18.0);
-        let allowed = out.bound.bound_at_mm(a[0]) + out.bound.bound_at_mm(b[0]);
+        // THE Error Bound contract (CONTEXT.md via BoundModel docs): a 95%
+        // bound on DISTANCES between two wall positions — what the measure
+        // tool and Clear Zone dimensions consume.
+        let allowed = out.bound.bound_between_mm(a[0], b[0]);
         let err = (measured - true_mm).abs();
         println!("{name}: measured {measured:.1} mm (true {true_mm}), err {err:.1} <= bound {allowed:.1}");
         assert!(
@@ -187,7 +193,7 @@ fn pan_recovers_known_distances_within_the_reported_error_bound() {
     let b = [3700.0f64, 150.0];
     let true_mm = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
     let measured = measure_mm(&out, a, b, 18.0);
-    let allowed = out.bound.bound_at_mm(a[0]) + out.bound.bound_at_mm(b[0]);
+    let allowed = out.bound.bound_between_mm(a[0], b[0]);
     let err = (measured - true_mm).abs();
     println!("full span: measured {measured:.1} mm (true {true_mm:.1}), err {err:.1} <= bound {allowed:.1}");
     assert!(
@@ -333,6 +339,106 @@ fn losing_track_mid_pan_fails_loudly() {
         Err(other) => panic!("expected TrackingLost/WeakSegment, got: {other}"),
         Ok(_) => panic!("a pan with a lost middle must not silently produce a result"),
     }
+}
+
+#[test]
+fn implausible_closure_is_refused_not_redistributed() {
+    // Marker B physically 130 mm but claimed 150 mm — a stand-in for every
+    // "closure demands a big scale rewrite" failure (blurred B, rotate-in-
+    // place sweep, marker off the wall plane). The measured scale
+    // correction (~1.15) is far beyond MAX_CLOSURE_SCALE_DEV: the guard
+    // must REFUSE the closure, return the honest open-loop result, and
+    // raise the closure_rejected flag — never redistribute the garbage.
+    let bad_scene = Scene {
+        markers: vec![
+            marker(0, 0.0, 0.0),
+            SyntheticMarker { id: 1, x_mm: B_X_MM, y_mm: 0.0, side_mm: 130.0, rot_quarter: 0 },
+        ],
+        dots: dots(),
+    };
+    let mut core = record_pan(&bad_scene, 60, 2.5, 1000);
+    let out = core.finish(1.0, true).expect("pan must still process open-loop");
+    assert!(
+        out.closure.is_none(),
+        "an implausible closure (scale {:?}) must not be applied",
+        out.closure.map(|c| c.scale_correction)
+    );
+    assert!(
+        out.closure_rejected,
+        "refusing a visible Marker B must raise the flag, never stay silent"
+    );
+    // And the bound must be the honest open-loop one: far wider than a
+    // clean closed-loop capture's.
+    let mut clean_core = record_pan(&scene(), 60, 2.5, 1000);
+    let clean = clean_core.finish(1.0, true).expect("clean pan");
+    assert!(
+        out.bound_far_end_mm() > 2.0 * clean.bound_far_end_mm(),
+        "rejected closure must fall back to the wide open-loop bound: \
+         rejected {:.1} mm vs clean {:.1} mm",
+        out.bound_far_end_mm(),
+        clean.bound_far_end_mm()
+    );
+}
+
+/// 3x3 box blur on an RGBA frame (test stand-in for motion blur at B).
+fn blur3(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            for ch in 0..3 {
+                let mut acc = 0u32;
+                for dy in 0..3 {
+                    for dx in 0..3 {
+                        acc += rgba[((y + dy - 1) * w + x + dx - 1) * 4 + ch] as u32;
+                    }
+                }
+                out[(y * w + x) * 4 + ch] = (acc / 9) as u8;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn blurred_marker_b_widens_the_bound_not_tightens_it() {
+    // Issue #4 review: with a CONSTANT closure-precision term, blurring
+    // Marker B silently tightened the bound while poisoning the result.
+    // The empirical per-view scatter must respond instead: same pan, same
+    // seed, blur over the last 30% of frames (where B lives) => the far
+    // bound must come out wider than the clean run's (or the closure must
+    // be refused outright, which yields the even wider open-loop bound).
+    let scene = scene();
+    let cam = camera();
+    let frames = 60usize;
+
+    let mut clean_core = PanCore::new(W, H);
+    let mut blurred_core = PanCore::new(W, H);
+    for (i, h) in cam.sequence(frames).iter().enumerate() {
+        let rgba = render_scene(&scene, h, W, H, 2.5, 1000 + i as u64);
+        clean_core.push_frame(&rgba);
+        if i >= frames * 7 / 10 {
+            blurred_core.push_frame(&blur3(&rgba, W, H));
+        } else {
+            blurred_core.push_frame(&rgba);
+        }
+    }
+    let clean = clean_core.finish(1.0, true).expect("clean pan");
+    assert!(clean.closure.is_some() && !clean.closure_rejected);
+    let blurred = blurred_core.finish(1.0, true).expect("blurred pan");
+
+    println!(
+        "far bound: clean {:.1} mm vs blurred-B {:.1} mm (closure applied: {}, rejected: {})",
+        clean.bound_far_end_mm(),
+        blurred.bound_far_end_mm(),
+        blurred.closure.is_some(),
+        blurred.closure_rejected,
+    );
+    assert!(
+        blurred.bound_far_end_mm() > clean.bound_far_end_mm(),
+        "blurring Marker B must WIDEN the far bound: clean {:.1} mm, blurred {:.1} mm",
+        clean.bound_far_end_mm(),
+        blurred.bound_far_end_mm()
+    );
 }
 
 #[test]

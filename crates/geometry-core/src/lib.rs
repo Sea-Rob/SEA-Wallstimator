@@ -413,6 +413,14 @@ impl PanWallImage {
         self.out.closure.is_some()
     }
 
+    /// True when Marker B was detected but its closure had to be REFUSED
+    /// (implausible drift/scale, bad back-projection, or a degenerate
+    /// correction). The result is open-loop; the page must warn and
+    /// recommend a retake rather than stay silent.
+    pub fn closure_rejected(&self) -> bool {
+        self.out.closure_rejected
+    }
+
     /// Measured chain drift at Marker B before correction (mm RMS over its
     /// corners); 0 when no closure.
     pub fn closure_discrepancy_mm(&self) -> f64 {
@@ -429,24 +437,43 @@ impl PanWallImage {
         self.out.closure.as_ref().map_or(1.0, |c| c.scale_correction)
     }
 
-    /// 95% Error Bound (mm) at wall x mm from Marker A's origin.
+    /// Per-position Error Bound component (mm) at wall x mm from Marker A's
+    /// origin. NOT a standalone 95% position bound — see
+    /// [`pan::BoundModel::bound_at_mm`]; use `error_bound_between_mm` for
+    /// the real contract.
     pub fn error_bound_mm_at(&self, x_mm: f64) -> f64 {
         self.out.bound.bound_at_mm(x_mm)
     }
 
-    /// 95% Error Bound (mm) near Marker A.
+    /// THE Error Bound contract: 95% bound (mm) on a distance measured
+    /// between wall positions xa and xb (what the measure tool and Clear
+    /// Zone dimensions consume). See [`pan::BoundModel::bound_between_mm`].
+    pub fn error_bound_between_mm(&self, xa_mm: f64, xb_mm: f64) -> f64 {
+        self.out.bound.bound_between_mm(xa_mm, xb_mm)
+    }
+
+    /// Error Bound component (mm) near Marker A.
     pub fn error_bound_near_mm(&self) -> f64 {
         self.out.bound_near_anchor_mm()
     }
 
-    /// 95% Error Bound (mm) at the far end of the rendered wall.
+    /// Error Bound component (mm) at the far end of the marker-bracketed
+    /// span.
     pub fn error_bound_far_mm(&self) -> f64 {
         self.out.bound_far_end_mm()
     }
 
-    /// Worst-case 95% Error Bound (mm) over the rendered extent.
+    /// Worst per-position component over the marker-bracketed span
+    /// (see [`pan::PanOutput::bound_worst_mm`]).
     pub fn error_bound_worst_mm(&self) -> f64 {
         self.out.bound_worst_mm()
+    }
+
+    /// Wall x (mm) of the far end of the marker-bracketed span — pairs with
+    /// `origin_x_mm`/`mm_per_px` to convert measure-tool taps to wall x for
+    /// `error_bound_between_mm`.
+    pub fn far_x_mm(&self) -> f64 {
+        self.out.far_x_mm
     }
 
     /// RANSAC inliers per chain link (keyframe i -> i+1).

@@ -76,9 +76,13 @@
 //! * **ramp(x)** — the *measured* residual drift left at B after
 //!   redistribution, ramped linearly over the anchor->B span.
 //!
-//! The 95% bound is `K95` times the quadrature sum. It is exposed as
-//! `bound_at(x)` plus near-anchor / far-end / worst-case scalars — the far
-//! end of a wall is honestly less certain than the metre around Marker A.
+//! The 95% bound is `K95` times the quadrature sum. **The public contract
+//! is the DISTANCE bound** [`BoundModel::bound_between_mm`] — a 95% bound
+//! on distances measured between two wall positions, which is what the
+//! measure tool and Clear Zone dimensions consume. Per-position values
+//! ([`BoundModel::bound_at_mm`]) are components with a documented
+//! systematic-bias caveat; the far end of a wall is honestly less certain
+//! than the metre around Marker A.
 
 use crate::detect::{detect_markers, DetectedMarker};
 use crate::homography::{estimate, Homography};
@@ -136,6 +140,19 @@ const K95: f64 = 2.0;
 /// ADR-0002's motivating error magnitude for unanchored chaining. A prior,
 /// not a measurement — the result is flagged so the UI can say so.
 const OPEN_LOOP_REL: f64 = 0.02;
+
+/// Closure plausibility: a measured drift beyond this is not credible chain
+/// drift — it means a bad Marker B detection, a rotate-in-place "pan", or a
+/// marker off the wall plane. Refuse the closure (fall back to the honest
+/// open-loop bound + a flag) rather than redistribute garbage. Shared with
+/// the CI tests so the production guard and the test's notion of
+/// "implausible" can never drift apart.
+pub const MAX_CLOSURE_DISCREPANCY_MM: f64 = 50.0;
+
+/// Closure plausibility: print scale is already corrected upstream
+/// (ADR-0002 self-verification), so a closure demanding more than a 3%
+/// scale rewrite is implausible for the same reasons as above.
+pub const MAX_CLOSURE_SCALE_DEV: f64 = 0.03;
 
 /// Furthest the stitched output extends from the anchor (mm).
 const MAX_PAN_EXTENT_MM: f64 = 8000.0;
@@ -340,10 +357,19 @@ impl PanCore {
             return Err(PanError::InvalidCorrectionFactor);
         }
         // A trailing candidate extends coverage (it overlaps the last
-        // keyframe by less than CANDIDATE_OVERLAP): commit it.
+        // keyframe by less than CANDIDATE_OVERLAP): commit it. Two guards
+        // (issue #4 review): a candidate whose accumulated shift spans an
+        // untrackable gap has a stale seed and must be dropped, not allowed
+        // to silently bridge the gap; and dropping for the keyframe cap
+        // must set the truncation flag like any other cap event.
         if let Some((cand, _)) = self.candidate.take() {
-            if self.keyframes.len() < MAX_KEYFRAMES {
+            if self.pending_gap {
+                // Stale across a gap: drop. Mid-recording commits already
+                // convert gaps to broken_after in push_frame.
+            } else if self.keyframes.len() < MAX_KEYFRAMES {
                 self.keyframes.push(cand);
+            } else {
+                self.truncated = true;
             }
         }
         if self.keyframes.is_empty() {
@@ -788,7 +814,18 @@ pub struct BoundModel {
 }
 
 impl BoundModel {
-    /// 95% Error Bound (mm) at wall position x mm from the anchor origin.
+    /// Per-position component (mm) of the Error Bound at wall position x mm
+    /// from the anchor origin.
+    ///
+    /// NOT a standalone 95% bound on absolute positions: positions carry a
+    /// known systematic bias from drift redistribution (the progressive
+    /// scale field can only correct up to the drift's unknown onset
+    /// profile; issue #4's review Monte Carlo measured far-end position
+    /// coverage of ~61%, driven by a same-signed displacement). That bias
+    /// is common-mode — it largely cancels between two points measured in
+    /// the same session — which is exactly why the distance contract of
+    /// [`BoundModel::bound_between_mm`] holds. Consume this only as a
+    /// building block for distance bounds.
     pub fn bound_at_mm(&self, x_mm: f64) -> f64 {
         let ax = x_mm.abs();
         let mut track_var = 0.0;
@@ -804,6 +841,19 @@ impl BoundModel {
             _ => 0.0,
         };
         K95 * (self.sigma_a_mm.powi(2) + track_var + (ax * self.rel).powi(2) + ramp_var).sqrt()
+    }
+
+    /// THE Error Bound contract (CONTEXT.md: per-session 95% bound on
+    /// measurement error): 95% bound (mm) on a DISTANCE measured between
+    /// wall positions `xa_mm` and `xb_mm`. Product measurements are
+    /// distances (measure tool, Clear Zone dimensions), and this reading
+    /// was empirically validated by issue #4's review Monte Carlo: 100%
+    /// coverage over 381 pairs (worst error/bound ratio 0.89) across 80
+    /// randomized pans. The endpoint SUM is deliberate — do not "tighten"
+    /// it to an RSS combination: measured worst ratios (0.89) exceed the
+    /// 1/sqrt(2) that an RSS bound assumes.
+    pub fn bound_between_mm(&self, xa_mm: f64, xb_mm: f64) -> f64 {
+        self.bound_at_mm(xa_mm) + self.bound_at_mm(xb_mm)
     }
 }
 
@@ -822,6 +872,12 @@ pub struct PanOutput {
     pub links: Vec<LinkQuality>,
     /// `None` when Marker B was never usable (open-loop result).
     pub closure: Option<Closure>,
+    /// True when Marker B WAS detected but its closure had to be refused —
+    /// implausible back-projection, an implausible measured drift/scale
+    /// (see [`MAX_CLOSURE_DISCREPANCY_MM`] / [`MAX_CLOSURE_SCALE_DEV`]), or
+    /// a degenerate correction. The result fell back to open-loop and the
+    /// UI must tell the Homeowner to retake rather than trust silence.
+    pub closure_rejected: bool,
     pub bound: BoundModel,
     /// Wall x (mm) of the anchor-nearest and far output edges — where the
     /// near/far bound scalars are evaluated.
@@ -835,8 +891,13 @@ impl PanOutput {
     pub fn bound_far_end_mm(&self) -> f64 {
         self.bound.bound_at_mm(self.far_x_mm)
     }
-    /// Worst-case bound over the rendered extent (the model is monotone in
-    /// distance from the anchor, so the far edge is the maximum).
+    /// Worst-case per-position component over the MARKER-BRACKETED SPAN
+    /// [0, `far_x_mm`] — the instrumented candidate area the two markers
+    /// bracket (ADR-0002); the model is monotone in |x|, so the span
+    /// maximum sits at `far_x_mm`. Rendered pixels beyond the markers are
+    /// uninstrumented extrapolation and can exceed this value —
+    /// [`BoundModel::bound_at_mm`] / [`BoundModel::bound_between_mm`]
+    /// remain valid to evaluate out there.
     pub fn bound_worst_mm(&self) -> f64 {
         self.bound_far_end_mm()
     }
@@ -855,6 +916,80 @@ fn local_mm_per_px(w_h: &Homography, wall: [f64; 2]) -> Option<f64> {
         return None;
     }
     Some(1.0 / px_per_mm)
+}
+
+/// Bilinear luma sample (callers guarantee 1 px of margin).
+fn sample_luma(gray: &[u8], w: usize, x: f64, y: f64) -> f64 {
+    let xf = x.floor() as usize;
+    let yf = y.floor() as usize;
+    let fx = x - xf as f64;
+    let fy = y - yf as f64;
+    let g = |xx: usize, yy: usize| gray[yy * w + xx] as f64;
+    g(xf, yf) * (1.0 - fx) * (1.0 - fy)
+        + g(xf + 1, yf) * fx * (1.0 - fy)
+        + g(xf, yf + 1) * (1.0 - fx) * fy
+        + g(xf + 1, yf + 1) * fx * fy
+}
+
+/// Edge blur width (px) of a detected marker's border: the luma profile
+/// along the outward normal at points along each edge is a black->white
+/// step whose contrast/max-gradient ratio measures how many pixels the
+/// transition is smeared over (~2 px sharp; grows with motion/defocus
+/// blur). Content-independent, unlike whole-frame sharpness — a marker
+/// keyframe always out-scores a bare-wall keyframe on Tenengrad no matter
+/// how blurred the marker is.
+fn marker_edge_blur_px(gray: &[u8], w: usize, h: usize, corners: &[[f64; 2]; 4]) -> f64 {
+    let cx = corners.iter().map(|c| c[0]).sum::<f64>() / 4.0;
+    let cy = corners.iter().map(|c| c[1]).sum::<f64>() / 4.0;
+    let mut widths: Vec<f64> = Vec::new();
+    for k in 0..4 {
+        let a = corners[k];
+        let b = corners[(k + 1) % 4];
+        for frac in [0.3, 0.5, 0.7] {
+            let mx = a[0] + (b[0] - a[0]) * frac;
+            let my = a[1] + (b[1] - a[1]) * frac;
+            let (mut nx, mut ny) = (-(b[1] - a[1]), b[0] - a[0]);
+            let len = (nx * nx + ny * ny).sqrt();
+            if len < 1e-9 {
+                continue;
+            }
+            nx /= len;
+            ny /= len;
+            if (mx - cx) * nx + (my - cy) * ny < 0.0 {
+                nx = -nx;
+                ny = -ny;
+            }
+            let mut prof = [0.0f64; 7];
+            let mut ok = true;
+            for (j, t) in (-3..=3).enumerate() {
+                let x = mx + nx * t as f64;
+                let y = my + ny * t as f64;
+                if x < 1.0 || y < 1.0 || x > (w - 2) as f64 || y > (h - 2) as f64 {
+                    ok = false;
+                    break;
+                }
+                prof[j] = sample_luma(gray, w, x, y);
+            }
+            if !ok {
+                continue;
+            }
+            let contrast =
+                prof.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+                    - prof.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mut grad = 0.0f64;
+            for j in 0..6 {
+                grad = grad.max((prof[j + 1] - prof[j]).abs());
+            }
+            if contrast > 20.0 && grad > 1e-9 {
+                widths.push((contrast / grad).clamp(1.0, 6.0));
+            }
+        }
+    }
+    if widths.is_empty() {
+        return 2.0; // no measurable edge: assume nominal sharpness
+    }
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    widths[widths.len() / 2]
 }
 
 /// 2D similarity fit (Umeyama, no reflection): scale, rotation, translation
@@ -956,7 +1091,10 @@ fn process(
             }
         }
         let matches = src.len();
-        let est = (matches >= 8)
+        // Fewer matches than the inlier gate accepts can never pass it —
+        // skip the estimation work (this threshold deliberately equals
+        // MIN_LINK_INLIERS; a lower one would be dead code).
+        let est = (matches >= MIN_LINK_INLIERS)
             .then(|| estimate(&src, &dst, LINK_INLIER_THRESHOLD_PX))
             .flatten();
         // Spread guard: inliers clustered in one corner of the frame cannot
@@ -1043,13 +1181,20 @@ fn process(
         s_dist[i] = s_dist[i + 1] - d;
     }
 
-    // 5. Loop closure against Marker B.
+    // 5. Loop closure against Marker B. The closure keyframe is chosen by
+    //    detection quality — area WEIGHTED BY SHARPNESS — not raw area: a
+    //    close-but-motion-blurred B otherwise beats a smaller sharp one and
+    //    poisons the closure (issue #4 review).
     let kb = (0..n)
-        .filter_map(|i| find(i, RIGHT_MARKER_ID).map(|m| (i, quad_area(&m.corners))))
+        .filter_map(|i| {
+            find(i, RIGHT_MARKER_ID)
+                .map(|m| (i, quad_area(&m.corners) * keyframes[i].sharpness.max(1e-9)))
+        })
         .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i);
 
     let mut closure: Option<Closure> = None;
+    let mut closure_rejected = false;
     let mut rel_from_closure: Option<f64> = None;
     let mut closure_ramp: Option<(f64, f64)> = None;
     let mut b_far_x: Option<f64> = None;
@@ -1072,6 +1217,10 @@ fn process(
             }
             Some(q)
         });
+        if q.is_none() {
+            // B was seen but back-projects implausibly: refuse, and say so.
+            closure_rejected = true;
+        }
         if let Some(q) = q {
             // Ideal rigid square of the known physical side, posed to fit
             // the back-projection: the pose is unknown (the Homeowner taped
@@ -1093,6 +1242,15 @@ fn process(
             let discrepancy_mm = rms4(&q, &s_fit);
             let (scale, _theta, _trans) = fit_similarity(&q, &s_fit);
 
+            // Plausibility guard (issue #4 review): drift beyond these
+            // limits is not credible chain drift — rotate-in-place "pans"
+            // measured 46% scale rewrites here and redistributing them
+            // produced confident garbage. Refuse; fall to open-loop + flag.
+            if discrepancy_mm > MAX_CLOSURE_DISCREPANCY_MM
+                || (scale - 1.0).abs() > MAX_CLOSURE_SCALE_DEV
+            {
+                closure_rejected = true;
+            } else {
             // Redistribute the drift as a progressive local-scale field:
             // the chain's scale error accumulated link by link, so the
             // correction at chain fraction t is a LOCAL scale of s^t
@@ -1177,9 +1335,52 @@ fn process(
                 // baseline, as relative scale uncertainty of the metric it
                 // anchors. Var(scale) = sigma^2 / sum|q~|^2 = sigma^2 /
                 // (2 side^2) for a square's 4 corners.
+                //
+                // sigma is MEASURED, not assumed (issue #4 review: a
+                // constant here silently tightened the bound exactly when
+                // B was blurred). Two real measurements feed it:
+                //  * B's own edge blur width in its closure keyframe —
+                //    corner localization error grows roughly linearly with
+                //    the edge transition width, so the floor is scaled by
+                //    (blur_px / 2), the sharp-edge reference;
+                //  * when >= 2 keyframes see B, the per-view closure-scale
+                //    scatter — a direct empirical precision of the very
+                //    quantity the closure estimates, absorbing blur and
+                //    chain noise at B.
+                // (The rigid-fit residual is NOT used here: it is dominated
+                // by systematic projective distortion of the chain at B and
+                // already feeds the bound via the closure ramp.)
                 let mmpp_b = local_mm_per_px(&Homography(w_chain[kb]), s_fit[0]).unwrap_or(1.0);
-                let sigma_b_mm = CORNER_SIGMA_FLOOR_PX * mmpp_b;
-                let sigma_scale = sigma_b_mm / (side_mm * std::f64::consts::SQRT_2);
+                let blur_px =
+                    marker_edge_blur_px(&keyframes[kb].gray, width, height, &marker_b.corners);
+                let blur_penalty = (blur_px / 2.0).max(1.0);
+                let sigma_b_mm = CORNER_SIGMA_FLOOR_PX * mmpp_b * blur_penalty;
+                let mut sigma_scale = sigma_b_mm / (side_mm * std::f64::consts::SQRT_2);
+                let view_scales: Vec<f64> = (0..n)
+                    .filter_map(|i| {
+                        let m = find(i, RIGHT_MARKER_ID)?;
+                        let hinv = Homography(mat3_inv(&w_chain[i])?);
+                        let mut qv = [[0.0f64; 2]; 4];
+                        for (k, c) in m.corners.iter().enumerate() {
+                            let (x, y) = hinv.apply(c[0], c[1])?;
+                            if x.abs() > MAX_PAN_EXTENT_MM * 2.0
+                                || y.abs() > MAX_PAN_EXTENT_MM * 2.0
+                            {
+                                return None;
+                            }
+                            qv[k] = [x, y];
+                        }
+                        let fit = fit_rigid_square(&local, &qv);
+                        Some(fit_similarity(&qv, &fit).0)
+                    })
+                    .collect();
+                if view_scales.len() >= 2 {
+                    let m = view_scales.len() as f64;
+                    let mean = view_scales.iter().sum::<f64>() / m;
+                    let var =
+                        view_scales.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / (m - 1.0);
+                    sigma_scale = sigma_scale.max(var.sqrt());
+                }
                 rel_from_closure = Some(sigma_scale);
                 // And the measured residual at B, ramped over the anchor->B
                 // span.
@@ -1190,7 +1391,11 @@ fn process(
                     residual_mm,
                     scale_correction: scale,
                 });
+            } else {
+                // Degenerate correction with B present: refuse, and say so.
+                closure_rejected = true;
             }
+            } // end plausibility-guard else
         }
     }
     // Refresh chain positions after redistribution (stitching seams and the
@@ -1391,6 +1596,7 @@ fn process(
         truncated,
         links: link_quality,
         closure,
+        closure_rejected,
         bound,
         far_x_mm,
     })

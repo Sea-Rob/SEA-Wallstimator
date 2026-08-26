@@ -239,13 +239,15 @@ async function startCapture(wasm, version, isolated) {
     if (!pan.recorder) return;
     pan.recording = false;
     stopPanBtn.hidden = true;
-    const kept = pan.recorder.keyframe_count();
+    // Claim the recorder synchronously: a second activation in the paint
+    // window below must find null here, not schedule a double-finish.
+    const recorder = pan.recorder;
+    pan.recorder = null;
+    const kept = recorder.keyframe_count();
     showPanStatus("ok", `Processing ${kept} keyframes (tracking, chaining, loop closure)…`);
     // Let the status paint before the synchronous WASM processing blocks
     // the main thread (single-threaded v1; a worker is a later slice).
     setTimeout(() => {
-      const recorder = pan.recorder;
-      pan.recorder = null;
       try {
         const image = recorder.finish(session.printScale.correctionFactor);
         try {
@@ -356,7 +358,21 @@ const rectified = {
   imageData: null, // base pixels, redrawn under the measure overlay
   mmPerPx: 0,
   points: [], // up to two [x, y] in canvas px
+  // Pan results only: sampled per-position Error Bound component, so each
+  // measurement can show its own 95% distance bound. Null for still
+  // captures (no Error Bound yet — see issue #17).
+  bound: null,
 };
+
+/** Conservative bound component (mm) at a canvas x, from the samples. */
+function boundComponentAt(canvasX) {
+  const b = rectified.bound;
+  const wallX = b.originXMm + canvasX * rectified.mmPerPx;
+  const t = (wallX - b.originXMm) / b.stepMm;
+  const i0 = Math.max(0, Math.min(b.samples.length - 1, Math.floor(t)));
+  const i1 = Math.max(0, Math.min(b.samples.length - 1, Math.ceil(t)));
+  return Math.max(b.samples[i0], b.samples[i1]);
+}
 
 // Recorded-pan state (issue #4).
 const pan = {
@@ -422,9 +438,14 @@ function updateMeasureReadout() {
   }
   const [[x1, y1], [x2, y2]] = rectified.points;
   const distMm = Math.hypot(x2 - x1, y2 - y1) * rectified.mmPerPx;
+  // Pan results carry the sampled bound: this measurement's own 95%
+  // distance bound is the sum of its two endpoint components.
+  const boundText = rectified.bound
+    ? ` ± ${(boundComponentAt(x1) + boundComponentAt(x2)).toFixed(0)} mm (95%)`
+    : "";
   measureResult.className = "result ok";
   measureResult.textContent =
-    `Distance: ${distMm.toFixed(1)} mm (${(distMm / 10).toFixed(1)} cm). ` +
+    `Distance: ${distMm.toFixed(1)} mm${boundText} (${(distMm / 10).toFixed(1)} cm). ` +
     "Check it against your tape measure. Tap again to restart.";
 }
 
@@ -467,28 +488,47 @@ function showPanResult(wasm, image) {
   rectified.mmPerPx = image.mm_per_px();
   rectified.points = [];
 
-  const nearMm = image.error_bound_near_mm();
-  const farMm = image.error_bound_far_mm();
   const closure = image.closure_applied();
+  const closureRejected = image.closure_rejected();
   const keyframes = image.keyframes_used();
   const truncated = image.truncated();
   const linkInliers = Array.from(image.link_inliers());
+  const originXMm = image.origin_x_mm();
+  const farXMm = image.far_x_mm();
+
+  // Sample the per-position bound component across the rendered extent
+  // BEFORE the WASM object is freed, so the measure tool can show every
+  // measurement's own distance bound (sum of its two endpoint components;
+  // that sum is the validated 95% contract).
+  const BOUND_SAMPLES = 256;
+  const boundStepMm = (width * rectified.mmPerPx) / (BOUND_SAMPLES - 1);
+  const boundSamples = new Float64Array(BOUND_SAMPLES);
+  for (let i = 0; i < BOUND_SAMPLES; i++) {
+    boundSamples[i] = image.error_bound_mm_at(originXMm + i * boundStepMm);
+  }
+  rectified.bound = { originXMm, stepMm: boundStepMm, samples: boundSamples };
+
+  const nearSpanMm = image.error_bound_between_mm(0, 300);
+  const fullSpanMm = image.error_bound_between_mm(0, farXMm);
 
   const meta = recordPanResult({
     widthPx: width,
     heightPx: height,
     mmPerPx: rectified.mmPerPx,
-    originXMm: image.origin_x_mm(),
+    originXMm,
     originYMm: image.origin_y_mm(),
     keyframesUsed: keyframes,
     truncated,
     closureApplied: closure,
+    closureRejected,
     closureDiscrepancyMm: image.closure_discrepancy_mm(),
     closureResidualMm: image.closure_residual_mm(),
     scaleCorrection: image.closure_scale_correction(),
-    errorBoundNearMm: nearMm,
-    errorBoundFarMm: farMm,
+    errorBoundNearMm: image.error_bound_near_mm(),
+    errorBoundFarMm: image.error_bound_far_mm(),
     errorBoundWorstMm: image.error_bound_worst_mm(),
+    errorBoundNearSpanMm: nearSpanMm,
+    errorBoundFullSpanMm: fullSpanMm,
     linkInliers,
   });
 
@@ -498,13 +538,21 @@ function showPanResult(wasm, image) {
 
   errorBoundEl.className = "result ok";
   errorBoundEl.textContent =
-    `Error Bound (95%): ±${nearMm.toFixed(0)} mm near Marker A / ` +
-    `±${farMm.toFixed(0)} mm at the far end. ` +
+    `Error Bound (95%, on distances): ±${nearSpanMm.toFixed(0)} mm for a short ` +
+    `span near Marker A, ±${fullSpanMm.toFixed(0)} mm across the full wall. ` +
+    "Each measurement below shows its own bound. " +
     (closure
       ? `Loop closed against Marker B (drift measured: ` +
         `${meta ? meta.closureDiscrepancyMm.toFixed(1) : "?"} mm, redistributed).`
-      : "Marker B was never usable, so drift could not be measured — " +
-        "far-end values are much less certain.");
+      : "Marker B could not be used to close the loop, so scale drift is " +
+        "bounded by a prior, not a measurement — treat far-end values with care.");
+  if (closureRejected) {
+    errorBoundEl.className = "result warn";
+    errorBoundEl.textContent +=
+      " A Marker B sighting had to be REJECTED (implausible drift — usually a " +
+      "blurred marker, a rotate-in-place sweep, or a marker off the wall " +
+      "plane). Re-record walking parallel to the wall with both markers sharp.";
+  }
 
   const weakest = linkInliers.length ? Math.min(...linkInliers) : 0;
   let summary =
@@ -552,6 +600,7 @@ function captureFrame(wasm, processor) {
     rectified.imageData = new ImageData(pixels.slice(), width, height);
     rectified.mmPerPx = image.mm_per_px();
     rectified.points = [];
+    rectified.bound = null; // stills have no Error Bound yet (issue #17)
 
     const markerIds = Array.from(image.marker_ids());
     const secondMarkerRejected = image.second_marker_rejected();

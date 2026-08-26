@@ -92,12 +92,15 @@ export function recordPanResult({
   keyframesUsed,
   truncated,
   closureApplied,
+  closureRejected,
   closureDiscrepancyMm,
   closureResidualMm,
   scaleCorrection,
   errorBoundNearMm,
   errorBoundFarMm,
   errorBoundWorstMm,
+  errorBoundNearSpanMm,
+  errorBoundFullSpanMm,
   linkInliers,
 }) {
   if (!session.printScale || !session.captureStarted) {
@@ -112,12 +115,19 @@ export function recordPanResult({
     keyframesUsed,
     truncated: Boolean(truncated),
     closureApplied: Boolean(closureApplied),
+    // Marker B was seen but its closure was refused (implausible drift):
+    // the result is open-loop and the Homeowner was told to retake.
+    closureRejected: Boolean(closureRejected),
     closureDiscrepancyMm,
     closureResidualMm,
     scaleCorrection,
+    // Per-position components (see pan.rs: not standalone 95% bounds).
     errorBoundNearMm,
     errorBoundFarMm,
     errorBoundWorstMm,
+    // THE 95% distance-bound contract, at two representative spans.
+    errorBoundNearSpanMm,
+    errorBoundFullSpanMm,
     linkInliers: Object.freeze(Array.from(linkInliers ?? [])),
   });
   return session.pan;
