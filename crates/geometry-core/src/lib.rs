@@ -20,6 +20,7 @@ pub mod detect;
 pub mod homography;
 pub mod linalg;
 pub mod marker;
+pub mod pan;
 pub mod rectify;
 pub mod synthetic;
 
@@ -293,6 +294,169 @@ impl RectifiedWallImage {
     /// Correspondences the final model kept as inliers.
     pub fn inliers(&self) -> u32 {
         self.inliers
+    }
+}
+
+/// Recorded-pan recorder (issue #4): the capture page writes each camera
+/// frame into [`PanRecorder::input_ptr`] and calls [`PanRecorder::push_frame`];
+/// the core keeps only sharp, well-spaced keyframes (capped, see
+/// [`pan::MAX_KEYFRAMES`]) so a multi-second pan never buffers gigabytes.
+/// [`PanRecorder::finish`] runs tracking, chaining, loop closure and
+/// stitching, returning a [`PanWallImage`].
+#[wasm_bindgen]
+pub struct PanRecorder {
+    core: pan::PanCore,
+    input_rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl PanRecorder {
+    #[wasm_bindgen(constructor)]
+    pub fn new(width: u32, height: u32) -> Result<PanRecorder, JsError> {
+        let n = checked_frame_pixels(width, height)
+            .ok_or_else(|| JsError::new("invalid frame dimensions"))?;
+        Ok(PanRecorder {
+            core: pan::PanCore::new(width as usize, height as usize),
+            input_rgba: vec![0; n * 4],
+        })
+    }
+
+    /// Pointer into WASM memory for the next RGBA frame (same convention as
+    /// [`FrameProcessor::input_ptr`]).
+    pub fn input_ptr(&mut self) -> *mut u8 {
+        self.input_rgba.as_mut_ptr()
+    }
+
+    pub fn frame_len(&self) -> usize {
+        self.input_rgba.len()
+    }
+
+    /// Consider the frame currently in the input buffer. Returns the
+    /// disposition: 0 kept, 1 skipped, 2 candidate, 3 keyframe cap reached.
+    pub fn push_frame(&mut self) -> u8 {
+        self.core.push_frame(&self.input_rgba) as u8
+    }
+
+    /// Keyframes committed so far (for live "keyframes kept: N" feedback).
+    pub fn keyframe_count(&self) -> u32 {
+        self.core.keyframe_count() as u32
+    }
+
+    /// Run the full post-capture pipeline (tracking, chaining, loop closure,
+    /// stitching, Error Bound). Errors carry a Homeowner-actionable message,
+    /// including which segment of the pan was untrackable.
+    pub fn finish(&mut self, correction_factor: f64) -> Result<PanWallImage, JsError> {
+        self.core
+            .finish(correction_factor, true)
+            .map(PanWallImage::from_core)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+}
+
+/// The stitched full-wall Rectified Wall Image plus the session's Error
+/// Bound. Metric mapping is identical to [`RectifiedWallImage`]:
+/// `wall_mm = origin_mm + pixel * mm_per_px`, wall origin at Marker A's
+/// printed top-left corner.
+#[wasm_bindgen]
+pub struct PanWallImage {
+    out: pan::PanOutput,
+}
+
+impl PanWallImage {
+    fn from_core(out: pan::PanOutput) -> Self {
+        PanWallImage { out }
+    }
+}
+
+#[wasm_bindgen]
+impl PanWallImage {
+    pub fn pixels_ptr(&self) -> *const u8 {
+        self.out.rgba.as_ptr()
+    }
+
+    pub fn pixels_len(&self) -> usize {
+        self.out.rgba.len()
+    }
+
+    pub fn width(&self) -> u32 {
+        self.out.width as u32
+    }
+
+    pub fn height(&self) -> u32 {
+        self.out.height as u32
+    }
+
+    pub fn mm_per_px(&self) -> f64 {
+        self.out.mm_per_px
+    }
+
+    pub fn origin_x_mm(&self) -> f64 {
+        self.out.origin_mm[0]
+    }
+
+    pub fn origin_y_mm(&self) -> f64 {
+        self.out.origin_mm[1]
+    }
+
+    pub fn keyframes_used(&self) -> u32 {
+        self.out.keyframes_used as u32
+    }
+
+    /// True when the keyframe cap cut the recording short (pan covered more
+    /// wall than could be kept; the far end may be missing).
+    pub fn truncated(&self) -> bool {
+        self.out.truncated
+    }
+
+    /// True when loop closure against Marker B was applied.
+    pub fn closure_applied(&self) -> bool {
+        self.out.closure.is_some()
+    }
+
+    /// Measured chain drift at Marker B before correction (mm RMS over its
+    /// corners); 0 when no closure.
+    pub fn closure_discrepancy_mm(&self) -> f64 {
+        self.out.closure.as_ref().map_or(0.0, |c| c.discrepancy_mm)
+    }
+
+    /// Drift remaining after redistribution (mm RMS); feeds the Error Bound.
+    pub fn closure_residual_mm(&self) -> f64 {
+        self.out.closure.as_ref().map_or(0.0, |c| c.residual_mm)
+    }
+
+    /// Scale correction the redistribution applied at the far end.
+    pub fn closure_scale_correction(&self) -> f64 {
+        self.out.closure.as_ref().map_or(1.0, |c| c.scale_correction)
+    }
+
+    /// 95% Error Bound (mm) at wall x mm from Marker A's origin.
+    pub fn error_bound_mm_at(&self, x_mm: f64) -> f64 {
+        self.out.bound.bound_at_mm(x_mm)
+    }
+
+    /// 95% Error Bound (mm) near Marker A.
+    pub fn error_bound_near_mm(&self) -> f64 {
+        self.out.bound_near_anchor_mm()
+    }
+
+    /// 95% Error Bound (mm) at the far end of the rendered wall.
+    pub fn error_bound_far_mm(&self) -> f64 {
+        self.out.bound_far_end_mm()
+    }
+
+    /// Worst-case 95% Error Bound (mm) over the rendered extent.
+    pub fn error_bound_worst_mm(&self) -> f64 {
+        self.out.bound_worst_mm()
+    }
+
+    /// RANSAC inliers per chain link (keyframe i -> i+1).
+    pub fn link_inliers(&self) -> Vec<u32> {
+        self.out.links.iter().map(|l| l.inliers as u32).collect()
+    }
+
+    /// Tracking RMS (px) per chain link.
+    pub fn link_rms_px(&self) -> Vec<f64> {
+        self.out.links.iter().map(|l| l.rms_px).collect()
     }
 }
 

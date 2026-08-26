@@ -131,13 +131,39 @@ pub fn reprojection_errors(h: &Homography, src: &[[f64; 2]], dst: &[[f64; 2]]) -
 }
 
 /// Levenberg-Marquardt refinement of a homography, minimizing the sum of
-/// squared reprojection errors. Parametrizes the 8 DoF as h / h[8] (falls
-/// back to the input if h[8] is degenerate, which our fronto-ish wall
-/// geometry never produces).
+/// squared reprojection errors. Parametrizes the 8 DoF as h / h[8].
+///
+/// When h[8] is (near-)zero the h[8]=1 chart is invalid — h[8] is the
+/// projective weight w at the source origin, and general chained
+/// homographies (issue #4) can legitimately put the origin near the
+/// vanishing line. Rather than silently returning the unrefined input, the
+/// source frame is re-anchored: translate it so a point with a healthy
+/// weight becomes the origin (H' = H·T has h'[8] = w(p)), refine there, and
+/// map the result back (H* = H'*·T⁻¹).
 pub fn refine_lm(h0: &Homography, src: &[[f64; 2]], dst: &[[f64; 2]]) -> Homography {
     let h = h0.0;
-    if h[8].abs() < 1e-9 {
-        return *h0;
+    let scale = h.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+    if h[8].abs() < 1e-6 * scale.max(1e-300) {
+        // Candidate anchors: the src centroid, then the src points themselves
+        // (each maps to a finite dst point, so at least one has w far from 0).
+        let n = src.len() as f64;
+        let centroid = src.iter().fold([0.0, 0.0], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+        let anchor = std::iter::once(centroid)
+            .chain(src.iter().copied())
+            .find(|p| (h[6] * p[0] + h[7] * p[1] + h[8]).abs() > 1e-3 * scale);
+        let Some(p) = anchor else {
+            return *h0; // every candidate sits on the vanishing line: give up
+        };
+        let t = [1.0, 0.0, p[0], 0.0, 1.0, p[1], 0.0, 0.0, 1.0];
+        let t_inv = [1.0, 0.0, -p[0], 0.0, 1.0, -p[1], 0.0, 0.0, 1.0];
+        let shifted = Homography(mat3_mul(&h, &t));
+        let s2 = shifted.0.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+        if shifted.0[8].abs() < 1e-6 * s2.max(1e-300) {
+            return *h0; // re-anchoring did not produce a valid chart
+        }
+        let src_shifted: Vec<[f64; 2]> = src.iter().map(|s| [s[0] - p[0], s[1] - p[1]]).collect();
+        let refined = refine_lm(&shifted, &src_shifted, dst);
+        return Homography(mat3_mul(&refined.0, &t_inv));
     }
     let mut p = [0.0f64; 8];
     for i in 0..8 {
@@ -385,6 +411,48 @@ mod tests {
         };
         let h1 = refine_lm(&h0, &src, &dst);
         assert!(cost(&h1) <= cost(&h0) + 1e-12, "LM must not increase cost");
+    }
+
+    #[test]
+    fn lm_refines_even_when_h8_is_zero() {
+        // h[8] = 0: the projective weight vanishes at the src origin, so the
+        // h/h[8] chart is invalid — the old code silently returned the input.
+        // Points live away from the vanishing line, so refinement is well
+        // posed after re-anchoring the source frame.
+        let h_deg: [f64; 9] = [
+            1.0, 0.1, 5.0, //
+            -0.1, 1.1, 3.0, //
+            1e-3, 1e-3, 0.0,
+        ];
+        let src = vec![
+            [100.0, 100.0],
+            [400.0, 120.0],
+            [420.0, 380.0],
+            [110.0, 400.0],
+            [250.0, 250.0],
+            [300.0, 150.0],
+        ];
+        let noise = [0.4, -0.3, 0.2, -0.4, 0.3, -0.2];
+        let dst: Vec<[f64; 2]> = src
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let d = apply_true(&h_deg, p);
+                [d[0] + noise[i], d[1] - noise[(i + 2) % 6]]
+            })
+            .collect();
+        let h0 = Homography(h_deg);
+        let cost = |h: &Homography| -> f64 {
+            reprojection_errors(h, &src, &dst).iter().map(|e| e * e).sum()
+        };
+        let h1 = refine_lm(&h0, &src, &dst);
+        assert!(
+            cost(&h1) < cost(&h0) - 1e-6,
+            "h[8]=0 input must actually be refined, not returned unchanged \
+             (cost {} -> {})",
+            cost(&h0),
+            cost(&h1)
+        );
     }
 
     #[test]

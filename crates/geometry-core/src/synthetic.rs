@@ -132,6 +132,87 @@ pub fn render_scene(
     rgba
 }
 
+/// Camera model for synthetic pan sequences (issue #4): a pinhole camera at
+/// distance `distance_mm` from the wall plane, translating from
+/// `start_center_mm` to `end_center_mm` (the wall x it points at), with a
+/// hand-held wobble in yaw / pitch / height. Returns one wall-mm -> image-px
+/// homography per frame.
+///
+/// Geometry: wall plane z = 0, x right, y down (both mm); camera at
+/// z = -distance looking along +z. For plane points, H = K·[r1 r2 | -R·C].
+pub struct PanCamera {
+    /// Focal length in pixels.
+    pub focal_px: f64,
+    pub width: usize,
+    pub height: usize,
+    pub distance_mm: f64,
+    pub start_center_mm: [f64; 2],
+    pub end_center_mm: [f64; 2],
+    /// Peak yaw wobble (radians) over the pan.
+    pub yaw_amp: f64,
+    /// Peak pitch wobble (radians).
+    pub pitch_amp: f64,
+}
+
+impl PanCamera {
+    /// Homography (wall mm -> image px) at pan progress `t` in [0, 1].
+    pub fn homography_at(&self, t: f64) -> [f64; 9] {
+        let cx = self.start_center_mm[0] + t * (self.end_center_mm[0] - self.start_center_mm[0]);
+        let cy = self.start_center_mm[1] + t * (self.end_center_mm[1] - self.start_center_mm[1]);
+        // Hand-held wobble: smooth pseudo-random oscillations.
+        let yaw = self.yaw_amp * (t * 11.0).sin();
+        let pitch = self.pitch_amp * (t * 8.5 + 1.2).sin();
+        let cam = [cx, cy + 12.0 * (t * 6.3).sin(), -self.distance_mm];
+
+        // R = Ry(yaw) · Rx(pitch), row-major.
+        let (sy, cyw) = yaw.sin_cos();
+        let (sp, cp) = pitch.sin_cos();
+        let r = [
+            cyw,
+            sy * sp,
+            sy * cp,
+            0.0,
+            cp,
+            -sp,
+            -sy,
+            cyw * sp,
+            cyw * cp,
+        ];
+        // -R·C
+        let tvec = [
+            -(r[0] * cam[0] + r[1] * cam[1] + r[2] * cam[2]),
+            -(r[3] * cam[0] + r[4] * cam[1] + r[5] * cam[2]),
+            -(r[6] * cam[0] + r[7] * cam[1] + r[8] * cam[2]),
+        ];
+        // M = [r1 r2 t] (columns 0, 1 of R and the translation).
+        let m = [
+            r[0], r[1], tvec[0], //
+            r[3], r[4], tvec[1], //
+            r[6], r[7], tvec[2],
+        ];
+        // K·M with K = [f 0 w/2; 0 f h/2; 0 0 1].
+        let (f, u0, v0) = (self.focal_px, self.width as f64 / 2.0, self.height as f64 / 2.0);
+        [
+            f * m[0] + u0 * m[6],
+            f * m[1] + u0 * m[7],
+            f * m[2] + u0 * m[8],
+            f * m[3] + v0 * m[6],
+            f * m[4] + v0 * m[7],
+            f * m[5] + v0 * m[8],
+            m[6],
+            m[7],
+            m[8],
+        ]
+    }
+
+    /// Homographies for an `n`-frame pan (t linearly spaced over [0, 1]).
+    pub fn sequence(&self, n: usize) -> Vec<[f64; 9]> {
+        (0..n)
+            .map(|i| self.homography_at(i as f64 / (n.max(2) - 1) as f64))
+            .collect()
+    }
+}
+
 /// Project a wall-plane point through a raw homography (mm -> px).
 pub fn project(h: &[f64; 9], x: f64, y: f64) -> [f64; 2] {
     let w = h[6] * x + h[7] * y + h[8];
