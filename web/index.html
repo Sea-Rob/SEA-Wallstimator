@@ -69,6 +69,18 @@
     .result.warn { display: block; background: #3a2c14; border: 1px solid #a83; color: #fdb; }
     #overlay { display: none; max-width: 100%; background: #000; border-radius: 8px; margin-top: 0.75rem; }
     #overlay.live { display: block; }
+    /* Live-coaching line (issue #5): ONE prominent message while recording. */
+    #coach {
+      display: none;
+      margin-top: 0.75rem;
+      padding: 0.8rem 1rem;
+      border-radius: 8px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      text-align: center;
+    }
+    #coach.ok { display: block; background: #143a1e; border: 1px solid #3a4; color: #bfb; }
+    #coach.warn { display: block; background: #52290f; border: 2px solid #f96; color: #fda; }
     #rectified {
       display: block;
       max-width: 100%;
@@ -143,6 +155,8 @@
       <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
       <video id="camera" playsinline muted hidden></video>
       <canvas id="overlay" width="640" height="480"></canvas>
+      <!-- Live-coaching line: one message, highest-priority check wins. -->
+      <div id="coach" role="status" aria-live="assertive"></div>
       <div id="pan-status" class="result" role="status"></div>
       <div id="capture-result" class="result" role="status"></div>
     </section>

@@ -20,6 +20,13 @@
 //! later commit beyond the gap, processing refuses with
 //! [`PanError::TrackingLost`] instead of silently chaining across it.
 //!
+//! Alongside selection, cheap live-coaching checks (issue #5) update a
+//! [`CoachStatus`] per frame — marker visibility (half-scale detection every
+//! Nth frame), motion speed, exposure, and a rotation-dominant-motion
+//! heuristic (issue #19: swiveling in place is coached away, not tolerated) —
+//! so the capture page can coach the Homeowner in real time and demand a
+//! retake when a recording ends without both markers ever seen.
+//!
 //! **After capture** ([`PanCore::finish`]):
 //! 1. Reference Markers are detected in every keyframe.
 //! 2. The wall frame is anchored at the best (largest) Marker A detection,
@@ -154,6 +161,473 @@ pub const MAX_CLOSURE_DISCREPANCY_MM: f64 = 50.0;
 /// scale rewrite is implausible for the same reasons as above.
 pub const MAX_CLOSURE_SCALE_DEV: f64 = 0.03;
 
+// ---------------------------------------------------------------------------
+// Live capture coaching (issue #5): cheap per-frame checks that run alongside
+// keyframe selection so the UI can coach the Homeowner WHILE recording. Every
+// check reuses what push_frame already computes (thumbnail shift -> motion
+// speed, thumbnail luma -> exposure) except marker detection, which runs on a
+// half-scale plane every [`COACH_DETECT_EVERY`] frames. Coaching is purely
+// observational: it never influences keyframe selection or processing.
+
+/// Run marker detection (half-scale plane) every Nth pushed frame. Full-res
+/// per-frame detection is not frame-budget cheap; at 30 fps this bounds the
+/// "marker (re)acquired" latency to ~170 ms.
+const COACH_DETECT_EVERY: u64 = 5;
+
+/// Frames since the last marker sighting before "marker lost" trips. Mid-pan
+/// on a long wall legitimately sees neither marker for a while — a slow,
+/// correct pan of a 3-4 m wall spends 5-7 s between losing A and finding B —
+/// so this is generous (~8 s at 30 fps), not a reaction-time constant.
+pub const COACH_MARKER_STALE_FRAMES: u64 = 240;
+
+/// Motion-speed hysteresis (fractions of frame width per frame) on an EMA of
+/// the tracked thumbnail shift. 0.028 * 640 px ~= 18 px/frame: at a typical
+/// 1/60 s exposure that smears ~9 px of motion blur across the frame — past
+/// what keyframe tracking tolerates. A full-width pan at the HI threshold
+/// takes ~1.2 s; the coached pace is several times slower.
+const COACH_SPEED_HI_FRAC: f64 = 0.028;
+const COACH_SPEED_LO_FRAC: f64 = 0.018;
+
+/// EMA smoothing for the speed check: reacts in ~3 frames (~100 ms).
+const COACH_SPEED_ALPHA: f64 = 0.4;
+
+/// Exposure thresholds on the thumbnail luma histogram: "too dark" when most
+/// of the frame sits near black, "blown out" when most sits at saturation.
+const COACH_DARK_LUMA: f32 = 40.0;
+const COACH_BRIGHT_LUMA: f32 = 240.0;
+const COACH_DARK_FRAC: f64 = 0.70;
+const COACH_BRIGHT_FRAC: f64 = 0.50;
+
+/// Consecutive frames an exposure condition must hold to trip / to clear
+/// (~130 ms at 30 fps): a single auto-exposure hiccup must not flash a cue.
+const COACH_EXPOSURE_DEBOUNCE: u32 = 4;
+
+/// Rotation-dominant motion (issue #19: coached away, not tolerated in the
+/// core), detected from the FLOW-FIELD CURVATURE. For a camera rotating in
+/// place the frame-to-frame image map is K·R·K^-1 — depth-independent — and
+/// a small yaw step d moves a pixel at horizontal offset u by
+/// `dx(u) ~= d·(f + u^2/f)`: a symmetric quadratic profile whose EDGES move
+/// faster than the CENTRE. Translation parallel to a fronto-parallel wall
+/// moves everything uniformly (zero curvature). So each frame the shift of
+/// three windows (left / centre / right thirds of a quarter-scale plane) is
+/// tracked and the curvature `(dxL + dxR)/2 - dxC`, sign-aligned with the
+/// centre flow, feeds a leaky accumulator; sustained rotation accumulates
+/// positive curvature while translation averages to zero. The per-frame
+/// signal is rotation RATE (d/f) — present from the first swivel frame, not
+/// only after the wall has become oblique.
+///
+/// HONEST LIMITS of this heuristic: (a) it needs trackable texture in all
+/// three probe windows — on a blank wall stretch it stays silent; (b) the
+/// per-frame signal is a fraction of a pixel, so the leaky accumulator
+/// needs ~0.7-1.5 s of sustained swivel to trip and a very slow swivel can
+/// hide under the sub-pixel NCC noise floor; (c) a small constant yaw LEAD
+/// while genuinely walking (the 5-10 degree case from issue #19's review)
+/// has near-zero rotation rate and is NOT caught; (d) walking toward/away
+/// from the wall produces diverging flow with near-zero centre shift, which
+/// the centre-flow gate mostly ignores — this check is specifically about
+/// rotation, not distance keeping. The post-capture closure plausibility
+/// guard remains the backstop for whatever coaching misses.
+/// Per-frame decay equivalent of the curvature accumulator (~50-frame leaky
+/// window). Probes run every [`COACH_ROT_EVERY`] frames, so each observation
+/// applies `COACH_ROT_DECAY^COACH_ROT_EVERY` — the wall-time constant stays
+/// put if the cadence changes.
+const COACH_ROT_DECAY: f64 = 0.98;
+/// Probe cadence (frames): every 2nd frame halves the probe cost, and the
+/// 2-frame baseline doubles the per-observation curvature signal over the
+/// same sub-pixel NCC noise.
+const COACH_ROT_EVERY: u64 = 2;
+/// Trip / clear thresholds for the curvature accumulator, as fractions of
+/// the frame width (accumulator unit: full-resolution px of edge-vs-centre
+/// flow difference). 0.0125 * 640 = 8 px; a sustained phone swivel measures
+/// ~0.4 px of curvature per frame, tripping in ~20 frames.
+const COACH_ROT_HI_FRAC: f64 = 0.0125;
+const COACH_ROT_LO_FRAC: f64 = 0.00625;
+/// Ignore curvature when the centre flow is under this many full-res px per
+/// frame (standing still: nothing to classify, let the accumulator decay).
+const COACH_ROT_MIN_FLOW_PX: f64 = 2.0;
+/// Cap one frame's curvature contribution (full-res px): a spurious probe
+/// match on a content jump must not trip the accumulator single-handedly.
+const COACH_ROT_MAX_STEP_PX: f64 = 1.5;
+/// Search radius (quarter-scale px) around the SEEDED position for the
+/// three probe windows. The global thumbnail tracker already measured the
+/// inter-frame shift, so the probes only search a small residual — this is
+/// what keeps three windows per probe frame within the frame budget.
+const COACH_ROT_PROBE_RADIUS: isize = 3;
+
+/// Coaching flags (bitmask in [`CoachStatus::flags`]). A flag is set while
+/// its (debounced) check is tripping.
+pub const COACH_NO_MARKER: u8 = 1 << 0;
+pub const COACH_MARKER_LOST: u8 = 1 << 1;
+pub const COACH_TOO_FAST: u8 = 1 << 2;
+pub const COACH_TOO_DARK: u8 = 1 << 3;
+pub const COACH_BLOWN_OUT: u8 = 1 << 4;
+pub const COACH_ROTATION: u8 = 1 << 5;
+
+/// The single highest-priority coaching cue for the UI's one-message line.
+/// Priority: marker problems > too fast > exposure > rotation — a lost
+/// marker invalidates the session outright, speed ruins the frames the
+/// markers would be found in, exposure ruins everything equally, and
+/// rotation is a motion-pattern nudge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoachCue {
+    AllGood = 0,
+    /// No Reference Marker has been seen yet: start with Marker A in view.
+    FindMarkerA = 1,
+    /// A marker was seen earlier but none for [`COACH_MARKER_STALE_FRAMES`].
+    MarkerLost = 2,
+    TooFast = 3,
+    TooDark = 4,
+    BlownOut = 5,
+    /// Rotation-dominant motion (stand-and-swivel / distance change).
+    RotationDominant = 6,
+}
+
+/// Compact per-frame coaching status. Read it after each
+/// [`PanCore::push_frame`]; all fields are cheap copies of already-computed
+/// state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoachStatus {
+    /// Bitmask of the `COACH_*` flags currently tripping (debounced).
+    pub flags: u8,
+    /// Marker A / B sighted at least once this recording (sticky). Both must
+    /// be true by the time recording stops, or the capture needs a retake.
+    pub marker_a_seen: bool,
+    pub marker_b_seen: bool,
+    /// Smoothed tracked motion (full-resolution px per frame).
+    pub speed_px_per_frame: f64,
+    /// Mean thumbnail luma of the last frame (0-255).
+    pub mean_luma: f64,
+    /// Current value of the rotation-curvature accumulator (leaky-summed
+    /// edge-vs-centre flow difference, full-res px; trips above
+    /// `COACH_ROT_HI_FRAC * width`).
+    pub rotation_drift: f64,
+    /// Fraction of motion frames that were untrackable or over the speed
+    /// limit — the "mostly blurred" retake signal (a proxy: untrackable
+    /// frames also include featureless wall, which reads as the same
+    /// Homeowner problem).
+    pub blur_fraction: f64,
+}
+
+impl CoachStatus {
+    /// Highest-priority active cue (see [`CoachCue`] for the ordering).
+    pub fn cue(&self) -> CoachCue {
+        if self.flags & COACH_NO_MARKER != 0 {
+            CoachCue::FindMarkerA
+        } else if self.flags & COACH_MARKER_LOST != 0 {
+            CoachCue::MarkerLost
+        } else if self.flags & COACH_TOO_FAST != 0 {
+            CoachCue::TooFast
+        } else if self.flags & COACH_TOO_DARK != 0 {
+            CoachCue::TooDark
+        } else if self.flags & COACH_BLOWN_OUT != 0 {
+            CoachCue::BlownOut
+        } else if self.flags & COACH_ROTATION != 0 {
+            CoachCue::RotationDominant
+        } else {
+            CoachCue::AllGood
+        }
+    }
+}
+
+/// What the thumbnail tracker saw for one frame, for coaching purposes.
+enum CoachMotion {
+    /// The very first frame: nothing to move relative to.
+    FirstFrame,
+    /// Frame-to-frame thumbnail shift (thumb px).
+    Tracked([f64; 2]),
+    /// The tracker lost this frame (motion blur / featureless wall).
+    Untracked,
+    /// A byte-identical repeat of the previous frame (the camera pipeline
+    /// delivered no new frame before the processing loop came round again).
+    /// Its zero shift says nothing about the pan's real speed — observing
+    /// it would yank the speed EMA down and make the TOO_FAST cue flicker
+    /// at exactly the rates where processing outpaces the camera.
+    Duplicate,
+}
+
+/// Internal live-coaching state, updated once per pushed frame.
+struct CoachState {
+    /// Frames observed so far (== push_frame calls).
+    frame_idx: u64,
+    seen_a: bool,
+    seen_b: bool,
+    last_marker_frame: Option<u64>,
+    speed_ema_px: f64,
+    too_fast: bool,
+    dark_streak: u32,
+    dark_clear_streak: u32,
+    too_dark: bool,
+    bright_streak: u32,
+    bright_clear_streak: u32,
+    blown_out: bool,
+    rot_acc: f64,
+    rotation: bool,
+    /// Probe windows (left, centre, right) from the last probe frame.
+    prev_probes: Option<[Vec<f32>; 3]>,
+    /// Global tracked shift (thumb px) accumulated since the last probe
+    /// frame: seeds the probe search so its radius stays tiny.
+    seed_acc: [f64; 2],
+    /// False when any frame since the last probe was untracked (the seed
+    /// would be stale — skip that probe round).
+    seed_valid: bool,
+    mean_luma: f64,
+    /// Motion frames that were untrackable or over the speed limit.
+    fast_frames: u64,
+    /// Frames with a motion observation (everything after the first frame).
+    motion_frames: u64,
+}
+
+impl CoachState {
+    fn new() -> CoachState {
+        CoachState {
+            frame_idx: 0,
+            seen_a: false,
+            seen_b: false,
+            last_marker_frame: None,
+            speed_ema_px: 0.0,
+            too_fast: false,
+            dark_streak: 0,
+            dark_clear_streak: 0,
+            too_dark: false,
+            bright_streak: 0,
+            bright_clear_streak: 0,
+            blown_out: false,
+            rot_acc: 0.0,
+            rotation: false,
+            prev_probes: None,
+            seed_acc: [0.0, 0.0],
+            seed_valid: false,
+            mean_luma: 0.0,
+            fast_frames: 0,
+            motion_frames: 0,
+        }
+    }
+
+    /// One coaching observation per pushed frame, reusing what push_frame
+    /// already computed: exposure from the thumbnail, motion speed from the
+    /// tracked thumbnail shift, marker detection every Nth frame on a
+    /// half-scale plane, and the rotation-curvature probes (seeded by the
+    /// tracked shift).
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &mut self,
+        gray: &[u8],
+        thumb: &[f32],
+        width: usize,
+        height: usize,
+        thumb_w: usize,
+        thumb_h: usize,
+        motion: CoachMotion,
+    ) {
+        let idx = self.frame_idx;
+        self.frame_idx += 1;
+
+        // Exposure: luma histogram of the (already computed) thumbnail.
+        let n = (thumb_w * thumb_h).max(1) as f64;
+        let (mut sum, mut dark, mut bright) = (0.0f64, 0u32, 0u32);
+        for &v in thumb {
+            sum += v as f64;
+            if v < COACH_DARK_LUMA {
+                dark += 1;
+            } else if v > COACH_BRIGHT_LUMA {
+                bright += 1;
+            }
+        }
+        self.mean_luma = sum / n;
+        let streak = |cond: bool, on: &mut u32, off: &mut u32, state: &mut bool| {
+            if cond {
+                *on += 1;
+                *off = 0;
+                if *on >= COACH_EXPOSURE_DEBOUNCE {
+                    *state = true;
+                }
+            } else {
+                *off += 1;
+                *on = 0;
+                if *off >= COACH_EXPOSURE_DEBOUNCE {
+                    *state = false;
+                }
+            }
+        };
+        streak(
+            dark as f64 / n > COACH_DARK_FRAC,
+            &mut self.dark_streak,
+            &mut self.dark_clear_streak,
+            &mut self.too_dark,
+        );
+        streak(
+            bright as f64 / n > COACH_BRIGHT_FRAC,
+            &mut self.bright_streak,
+            &mut self.bright_clear_streak,
+            &mut self.blown_out,
+        );
+
+        // Marker visibility: detection on a half-scale plane every Nth frame
+        // (full-res, every-frame detection would blow the frame budget). The
+        // detector needs >= 32 px planes and a marker >= 14 px — at half
+        // scale that is a 28 px marker in the frame, comfortably met when a
+        // marker is genuinely "in view" at pan distance.
+        if idx % COACH_DETECT_EVERY == 0 && width >= 64 && height >= 64 {
+            let (half, hw, hh) = half_scale(gray, width, height);
+            for m in detect_markers(&half, hw, hh) {
+                match m.id {
+                    LEFT_MARKER_ID => self.seen_a = true,
+                    RIGHT_MARKER_ID => self.seen_b = true,
+                    _ => {}
+                }
+                self.last_marker_frame = Some(idx);
+            }
+        }
+
+        // Motion speed + blur bookkeeping (every frame after the first).
+        let hi = COACH_SPEED_HI_FRAC * width as f64;
+        let lo = COACH_SPEED_LO_FRAC * width as f64;
+        match motion {
+            CoachMotion::FirstFrame | CoachMotion::Duplicate => {}
+            CoachMotion::Tracked(shift) => {
+                self.motion_frames += 1;
+                let px = shift[0].hypot(shift[1]) * THUMB_DIV as f64;
+                self.speed_ema_px =
+                    COACH_SPEED_ALPHA * px + (1.0 - COACH_SPEED_ALPHA) * self.speed_ema_px;
+                if self.speed_ema_px > hi {
+                    self.too_fast = true;
+                } else if self.speed_ema_px < lo {
+                    self.too_fast = false;
+                }
+                if px > hi {
+                    self.fast_frames += 1;
+                }
+                self.seed_acc[0] += shift[0];
+                self.seed_acc[1] += shift[1];
+            }
+            // Untrackable: motion blur or a featureless stretch — either way
+            // a frame the pipeline cannot use; count it for blur_fraction
+            // but leave the (unmeasurable) speed state alone. The probe seed
+            // is stale now, so the next probe round is skipped.
+            CoachMotion::Untracked => {
+                self.motion_frames += 1;
+                self.fast_frames += 1;
+                self.seed_valid = false;
+            }
+        }
+
+        // Rotation-dominant motion: flow-field curvature on a quarter-scale
+        // plane (see the COACH_ROT_* docs — the quadratic K·R·K^-1 flow
+        // profile of an in-place rotation, which uniform translation lacks).
+        // Quarter scale (not the 1/8 thumbnail) because the per-observation
+        // signal is sub-pixel: twice the resolution halves the relative NCC
+        // noise. Every COACH_ROT_EVERY frames, seeded by the accumulated
+        // global shift, to stay within the frame budget.
+        if idx % COACH_ROT_EVERY != 0 {
+            return;
+        }
+        let qw = width / 4;
+        let qh = height / 4;
+        let win_w = qw / 3;
+        if win_w >= 12 && qh >= 12 {
+            let quarter = downscale(gray, width, height, qw, qh);
+            let extract = |x0: usize| -> Vec<f32> {
+                let mut out = vec![0f32; win_w * qh];
+                for y in 0..qh {
+                    out[y * win_w..(y + 1) * win_w]
+                        .copy_from_slice(&quarter[y * qw + x0..y * qw + x0 + win_w]);
+                }
+                out
+            };
+            // Left / centre / right thirds, centres (qw - win_w)/2 apart.
+            let probes = [extract(0), extract((qw - win_w) / 2), extract(qw - win_w)];
+            // Thumb-px seed -> quarter px (thumbnail is 1/8, quarter 1/4).
+            let seed = (
+                (self.seed_acc[0] * THUMB_DIV as f64 / 4.0).round() as isize,
+                (self.seed_acc[1] * THUMB_DIV as f64 / 4.0).round() as isize,
+            );
+            let decay = COACH_ROT_DECAY.powi(COACH_ROT_EVERY as i32);
+            if let (Some(prev), true) = (&self.prev_probes, self.seed_valid) {
+                let track = |i: usize| {
+                    ncc_shift_search(&prev[i], &probes[i], win_w, qh, COACH_ROT_PROBE_RADIUS, seed)
+                        .filter(|&(_, _, s)| s >= MIN_SHIFT_SCORE)
+                };
+                match (track(0), track(1), track(2)) {
+                    (Some((lx, _, _)), Some((cx, _, _)), Some((rx, _, _)))
+                        if cx.abs() * 4.0 >= COACH_ROT_MIN_FLOW_PX * COACH_ROT_EVERY as f64 =>
+                    {
+                        // Curvature in full-res px, sign-aligned with the
+                        // centre flow so rotation accumulates positive and
+                        // translation noise averages out; capped so one
+                        // spurious match cannot trip the check alone.
+                        let cap = COACH_ROT_MAX_STEP_PX * COACH_ROT_EVERY as f64;
+                        let curv = ((lx + rx) / 2.0 - cx) * 4.0 * cx.signum();
+                        self.rot_acc = self.rot_acc * decay + curv.clamp(-cap, cap);
+                    }
+                    _ => self.rot_acc *= decay,
+                }
+                if self.rot_acc > COACH_ROT_HI_FRAC * width as f64 {
+                    self.rotation = true;
+                } else if self.rot_acc < COACH_ROT_LO_FRAC * width as f64 {
+                    self.rotation = false;
+                }
+            } else {
+                self.rot_acc *= decay;
+            }
+            self.prev_probes = Some(probes);
+            self.seed_acc = [0.0, 0.0];
+            self.seed_valid = true;
+        }
+    }
+
+    fn status(&self) -> CoachStatus {
+        let mut flags = 0u8;
+        match self.last_marker_frame {
+            None => {
+                if self.frame_idx > 0 {
+                    flags |= COACH_NO_MARKER;
+                }
+            }
+            Some(f) => {
+                if self.frame_idx.saturating_sub(f) > COACH_MARKER_STALE_FRAMES {
+                    flags |= COACH_MARKER_LOST;
+                }
+            }
+        }
+        if self.too_fast {
+            flags |= COACH_TOO_FAST;
+        }
+        if self.too_dark {
+            flags |= COACH_TOO_DARK;
+        }
+        if self.blown_out {
+            flags |= COACH_BLOWN_OUT;
+        }
+        if self.rotation {
+            flags |= COACH_ROTATION;
+        }
+        CoachStatus {
+            flags,
+            marker_a_seen: self.seen_a,
+            marker_b_seen: self.seen_b,
+            speed_px_per_frame: self.speed_ema_px,
+            mean_luma: self.mean_luma,
+            rotation_drift: self.rot_acc,
+            blur_fraction: self.fast_frames as f64 / self.motion_frames.max(1) as f64,
+        }
+    }
+}
+
+/// 2x2 box downscale of a luma plane (u8, for the coaching marker check).
+fn half_scale(gray: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+    let hw = w / 2;
+    let hh = h / 2;
+    let mut out = vec![0u8; hw * hh];
+    for y in 0..hh {
+        for x in 0..hw {
+            let i = 2 * y * w + 2 * x;
+            let s = gray[i] as u16 + gray[i + 1] as u16 + gray[i + w] as u16 + gray[i + w + 1] as u16;
+            out[y * hw + x] = (s / 4) as u8;
+        }
+    }
+    (out, hw, hh)
+}
+
 /// Furthest the stitched output extends from the anchor (mm).
 const MAX_PAN_EXTENT_MM: f64 = 8000.0;
 
@@ -215,6 +689,9 @@ pub struct PanCore {
     /// Keyframe index after which continuity broke (sticky, first gap).
     broken_after: Option<usize>,
     truncated: bool,
+    /// Live-coaching state (issue #5): observational only — never influences
+    /// keyframe selection or processing.
+    coach: CoachState,
 }
 
 impl PanCore {
@@ -232,11 +709,17 @@ impl PanCore {
             pending_gap: false,
             broken_after: None,
             truncated: false,
+            coach: CoachState::new(),
         }
     }
 
     pub fn keyframe_count(&self) -> usize {
         self.keyframes.len()
+    }
+
+    /// Live-coaching status as of the last pushed frame (issue #5).
+    pub fn coach_status(&self) -> CoachStatus {
+        self.coach.status()
     }
 
     pub fn truncated(&self) -> bool {
@@ -265,6 +748,15 @@ impl PanCore {
             shift_from_prev,
         };
         if self.keyframes.is_empty() {
+            self.coach.observe(
+                &gray,
+                &thumb,
+                self.width,
+                self.height,
+                self.thumb_w,
+                self.thumb_h,
+                CoachMotion::FirstFrame,
+            );
             self.keyframes.push(retain(gray, sharpness, [0.0, 0.0]));
             self.prev_thumb = Some(thumb);
             self.acc_shift = [0.0, 0.0];
@@ -275,6 +767,23 @@ impl PanCore {
         let prev = self.prev_thumb.as_ref().unwrap();
         let shift = ncc_shift_local(prev, &thumb, self.thumb_w, self.thumb_h);
         let tracked = shift.filter(|&(_, _, s)| s >= MIN_SHIFT_SCORE);
+        self.coach.observe(
+            &gray,
+            &thumb,
+            self.width,
+            self.height,
+            self.thumb_w,
+            self.thumb_h,
+            match tracked {
+                // A perfect-correlation zero shift is a repeated camera
+                // frame, not a measurement of a stationary pan.
+                Some((dx, dy, s)) if dx == 0.0 && dy == 0.0 && s > 0.999 => {
+                    CoachMotion::Duplicate
+                }
+                Some((dx, dy, _)) => CoachMotion::Tracked([dx, dy]),
+                None => CoachMotion::Untracked,
+            },
+        );
         let Some((ddx, ddy, _score)) = tracked else {
             // Untrackable content (blank wall / motion blur): keeping it
             // would spend the cap on frames the tracker cannot use anyway.
@@ -445,6 +954,20 @@ const SHIFT_RADIUS: isize = 8;
 /// refinement: returns (dx, dy, peak score) in thumb px, where (dx, dy)
 /// shifts image `a` onto image `b`.
 fn ncc_shift_local(a: &[f32], b: &[f32], tw: usize, th: usize) -> Option<(f64, f64, f64)> {
+    ncc_shift_search(a, b, tw, th, SHIFT_RADIUS, (0, 0))
+}
+
+/// [`ncc_shift_local`] with an explicit search radius around a seed offset
+/// (the live-coaching rotation probes search a tiny radius around the
+/// already-tracked global shift).
+fn ncc_shift_search(
+    a: &[f32],
+    b: &[f32],
+    tw: usize,
+    th: usize,
+    radius: isize,
+    seed: (isize, isize),
+) -> Option<(f64, f64, f64)> {
     let score = |dx: isize, dy: isize| -> f64 {
         // Overlap window in `a` coordinates.
         let x0 = 0.max(-dx) as usize;
@@ -480,8 +1003,8 @@ fn ncc_shift_local(a: &[f32], b: &[f32], tw: usize, th: usize) -> Option<(f64, f
     };
 
     let mut best = (0isize, 0isize, -2.0f64);
-    for dy in -SHIFT_RADIUS..=SHIFT_RADIUS {
-        for dx in -SHIFT_RADIUS..=SHIFT_RADIUS {
+    for dy in seed.1 - radius..=seed.1 + radius {
+        for dx in seed.0 - radius..=seed.0 + radius {
             let s = score(dx, dy);
             if s > best.2 {
                 best = (dx, dy, s);

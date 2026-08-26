@@ -50,6 +50,7 @@ const captureFrameBtn = document.getElementById("capture-frame");
 const recordPanBtn = document.getElementById("record-pan");
 const stopPanBtn = document.getElementById("stop-pan");
 const panStatus = document.getElementById("pan-status");
+const coachEl = document.getElementById("coach");
 const errorBoundEl = document.getElementById("error-bound");
 const captureResult = document.getElementById("capture-result");
 const rectifiedSection = document.getElementById("step-rectified");
@@ -230,19 +231,33 @@ async function startCapture(wasm, version, isolated) {
       return;
     }
     pan.recording = true;
+    pan.lastKept = 0;
+    pan.lastCue = -1;
     recordPanBtn.hidden = true;
     captureFrameBtn.disabled = true;
     stopPanBtn.hidden = false;
+    showCoach(1); // "Start with Marker A in view" until the core sees it
     showPanStatus("ok", "Recording — pan slowly from Marker A to Marker B. Keyframes kept: 1");
   });
   stopPanBtn.addEventListener("click", () => {
     if (!pan.recorder) return;
     pan.recording = false;
     stopPanBtn.hidden = true;
+    hideCoach();
     // Claim the recorder synchronously: a second activation in the paint
     // window below must find null here, not schedule a double-finish.
     const recorder = pan.recorder;
     pan.recorder = null;
+    // Retake gate (issue #5): failures surface NOW, with the reason, rather
+    // than after a long processing wait that cannot succeed.
+    const reason = retakeReason(recorder);
+    if (reason) {
+      recorder.free();
+      recordPanBtn.hidden = false;
+      captureFrameBtn.disabled = false;
+      showPanStatus("warn", `Please record the pan again — ${reason}`);
+      return;
+    }
     const kept = recorder.keyframe_count();
     showPanStatus("ok", `Processing ${kept} keyframes (tracking, chaining, loop closure)…`);
     // Let the status paint before the synchronous WASM processing blocks
@@ -304,6 +319,13 @@ async function startCapture(wasm, version, isolated) {
         frame.data,
       );
       pan.recorder.push_frame();
+      // Live coaching (issue #5): one prominent line, the core's single
+      // highest-priority cue, updated the frame a check trips or clears.
+      const cue = pan.recorder.coach_cue();
+      if (cue !== pan.lastCue) {
+        pan.lastCue = cue;
+        showCoach(cue);
+      }
       const kept = pan.recorder.keyframe_count();
       if (kept !== pan.lastKept) {
         pan.lastKept = kept;
@@ -379,7 +401,58 @@ const pan = {
   recorder: null,
   recording: false,
   lastKept: 0,
+  lastCue: -1,
 };
+
+// Live-coaching cues (issue #5): the core resolves the single
+// highest-priority tripping check (lost marker > too fast > exposure >
+// rotation) to one code; this page only renders the words. Codes match
+// geometry-core's pan::CoachCue.
+const COACH_MESSAGES = {
+  0: ["ok", "Looking good — keep panning slowly toward Marker B."],
+  1: ["warn", "Start with Marker A fully in view."],
+  2: ["warn", "No marker seen for a while — keep the markers' line in frame and keep going toward Marker B."],
+  3: ["warn", "Slow down — pan more slowly so the frames stay sharp."],
+  4: ["warn", "Too dark — turn on a light."],
+  5: ["warn", "Too bright — the image is washing out. Avoid aiming at direct light."],
+  6: ["warn", "Keep walking along the wall — don't stand in place and swivel."],
+};
+
+function showCoach(cue) {
+  const [kind, message] = COACH_MESSAGES[cue] ?? COACH_MESSAGES[0];
+  coachEl.className = kind;
+  coachEl.textContent = message;
+}
+
+function hideCoach() {
+  coachEl.className = "";
+  coachEl.textContent = "";
+}
+
+/**
+ * End-of-recording gate (issue #5): a recording that never saw both
+ * Reference Markers — or was mostly blurred/untrackable — gets an immediate
+ * retake prompt with the reason INSTEAD of processing. Returns the reason,
+ * or null when the recording is worth processing.
+ */
+function retakeReason(recorder) {
+  const aSeen = recorder.marker_a_seen();
+  const bSeen = recorder.marker_b_seen();
+  if (!aSeen && !bSeen) {
+    return "neither Reference Marker was ever seen. Start with Marker A in view and finish with Marker B in view.";
+  }
+  if (!aSeen) {
+    return "Marker A was never seen. Start the pan with Marker A (left end) fully in view.";
+  }
+  if (!bSeen) {
+    return "Marker B was never seen. Keep panning until Marker B (right end) is fully in view before stopping.";
+  }
+  const blurFraction = recorder.blur_fraction();
+  if (blurFraction > 0.5) {
+    return `most of the recording (${Math.round(blurFraction * 100)}%) was too blurred or fast to track. Pan again, slowly and steadily.`;
+  }
+  return null;
+}
 
 function errMsg(err) {
   return err && err.message ? err.message : String(err);
