@@ -28,14 +28,29 @@ With two Reference Markers taped one per wall end (ADR-0002), the Homeowner reco
 - `web/` — capture page (plain JS, no framework), `print-scale.js` (pure correction/plausibility math), `session.js` (in-memory session state), and a tiny dev server that sends the COOP/COEP headers.
 - `web/pkg/` — generated WASM bundle (built, not committed).
 
-## Prerequisites
+## Building, testing and serving (containers)
 
-- Rust stable with the `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`)
-- [wasm-pack](https://rustwasm.github.io/wasm-pack/)
-- `wasm-opt` (binaryen)
-- Node.js ≥ 18 (dev server only; no npm dependencies)
+Everything builds, tests and serves **in containers** — the host needs only
+Docker (rootless works; this repo is developed against a rootless daemon):
 
-## Commands
+```sh
+docker compose up web --build      # build the WASM core in-image and serve http://localhost:8787/
+docker compose run --rm test-rust  # cargo test --workspace (toolchain image)
+docker compose run --rm test-js    # node --test JS unit tests
+docker compose run --rm build-wasm # write web/pkg/ into the working tree...
+docker compose up dev              # ...and serve the working tree live (bind mount)
+```
+
+The `Dockerfile` stages: `toolchain` (Rust 1.98 + wasm32 target + wasm-pack
+0.15 + binaryen + Node 24), `wasm-build` (compiles `web/pkg` from a clean
+source copy), `serve` (node:24-slim + the capture page + COOP/COEP headers).
+Named volumes keep cargo builds incremental across `test-rust`/`build-wasm`
+runs.
+
+### Host-toolchain fallback (not the supported path)
+
+The `package.json` scripts the containers run are usable directly if you have
+Rust (+`wasm32-unknown-unknown`), wasm-pack, binaryen and Node ≥ 18 installed:
 
 ```sh
 npm run dev         # build WASM (release) and serve http://localhost:8787/
