@@ -57,3 +57,69 @@ test("resetSession clears the rectified record", () => {
   resetSession();
   assert.equal(session.rectified, null);
 });
+
+// --- Recorded pan (issue #4 slice) -----------------------------------------
+
+const { recordPanResult } = await import("../session.js");
+
+const PAN = {
+  widthPx: 2100,
+  heightPx: 400,
+  mmPerPx: 2.0,
+  originXMm: -140,
+  originYMm: -110,
+  keyframesUsed: 10,
+  truncated: false,
+  closureApplied: true,
+  closureDiscrepancyMm: 5.5,
+  closureResidualMm: 5.5,
+  scaleCorrection: 1.0082,
+  errorBoundNearMm: 10.1,
+  errorBoundFarMm: 29.1,
+  errorBoundWorstMm: 29.1,
+  linkInliers: [29, 16, 14, 25, 21, 26, 17, 14, 28],
+};
+
+test("pan result cannot be recorded before print scale is verified", () => {
+  resetSession();
+  assert.equal(recordPanResult(PAN), null);
+  assert.equal(session.pan, null);
+});
+
+test("pan result cannot be recorded before capture starts", () => {
+  resetSession();
+  recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
+  assert.equal(recordPanResult(PAN), null);
+});
+
+test("pan result records after scale verification + capture lock, frozen, and re-record replaces it", () => {
+  resetSession();
+  recordPrintScale({ measuredMm: 188, nominalMm: 200, correctionFactor: 0.94 });
+  lockForCapture();
+  const stored = recordPanResult(PAN);
+  assert.equal(stored, session.pan);
+  assert.equal(stored.keyframesUsed, 10);
+  assert.equal(stored.closureApplied, true);
+  assert.equal(stored.errorBoundFarMm, 29.1);
+  assert.ok(Object.isFrozen(stored), "pan record must be immutable");
+  assert.ok(Object.isFrozen(stored.linkInliers), "link list must be immutable");
+  assert.deepEqual([...stored.linkInliers], PAN.linkInliers);
+
+  const again = recordPanResult({ ...PAN, keyframesUsed: 12, closureApplied: false });
+  assert.equal(session.pan, again);
+  assert.equal(again.keyframesUsed, 12);
+  assert.equal(again.closureApplied, false);
+});
+
+test("pan record coexists with the still rectified record and resets with the session", () => {
+  resetSession();
+  recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
+  lockForCapture();
+  recordRectifiedWallImage(RECT);
+  recordPanResult(PAN);
+  assert.ok(session.rectified, "still record intact");
+  assert.ok(session.pan, "pan record present");
+  resetSession();
+  assert.equal(session.pan, null);
+  assert.equal(session.rectified, null);
+});

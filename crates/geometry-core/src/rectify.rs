@@ -57,7 +57,7 @@ impl Rectified {
 
 /// World-plane (mm) corner coordinates of the anchor marker: printed
 /// top-left at the origin, clockwise.
-fn anchor_corners_mm(side_mm: f64) -> [[f64; 2]; 4] {
+pub(crate) fn anchor_corners_mm(side_mm: f64) -> [[f64; 2]; 4] {
     [[0.0, 0.0], [side_mm, 0.0], [side_mm, side_mm], [0.0, side_mm]]
 }
 
@@ -130,7 +130,7 @@ fn estimate_wall_homography(
 
 /// 2D Kabsch with fixed scale: rotation + translation mapping `local` onto
 /// `target` in the least-squares sense.
-fn fit_rigid_square(local: &[[f64; 2]; 4], target: &[[f64; 2]; 4]) -> [[f64; 2]; 4] {
+pub(crate) fn fit_rigid_square(local: &[[f64; 2]; 4], target: &[[f64; 2]; 4]) -> [[f64; 2]; 4] {
     let cen = |pts: &[[f64; 2]; 4]| -> [f64; 2] {
         let mut c = [0.0, 0.0];
         for p in pts {

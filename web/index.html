@@ -131,12 +131,19 @@
 
     <section id="step-capture">
       <h2>3 · Capture the wall</h2>
-      <p>Point the camera so a Reference Marker is fully in view, then capture a frame.</p>
+      <p>
+        Point the camera so a Reference Marker is fully in view, then capture a
+        single frame — or <strong>record a pan</strong>: start at Marker A (left),
+        sweep slowly and steadily across the wall to Marker B (right), then stop.
+      </p>
       <button id="start-capture" class="primary" disabled>Start camera</button>
       <button id="capture-frame" class="primary" hidden>Capture frame</button>
+      <button id="record-pan" class="primary" hidden>Record pan</button>
+      <button id="stop-pan" hidden>Stop &amp; process</button>
       <!-- Hidden video feeds frames; the canvas shows the core's processed overlay. -->
       <video id="camera" playsinline muted hidden></video>
       <canvas id="overlay" width="640" height="480"></canvas>
+      <div id="pan-status" class="result" role="status"></div>
       <div id="capture-result" class="result" role="status"></div>
     </section>
 
@@ -148,6 +155,7 @@
         check it against a tape measure on the wall.
       </p>
       <canvas id="rectified"></canvas>
+      <div id="error-bound" class="result" role="status"></div>
       <div id="measure-result" class="result" role="status"></div>
       <button id="clear-measure" hidden>Clear points</button>
     </section>

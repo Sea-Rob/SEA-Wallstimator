@@ -17,6 +17,7 @@
 
 import init, {
   FrameProcessor,
+  PanRecorder,
   core_version,
   ruler_nominal_mm,
 } from "./pkg/geometry_core.js";
@@ -25,6 +26,7 @@ import {
   session,
   recordPrintScale,
   recordRectifiedWallImage,
+  recordPanResult,
   hasVerifiedPrintScale,
   lockForCapture,
 } from "./session.js";
@@ -45,6 +47,10 @@ const exactBtn = document.getElementById("exact-nominal");
 const scaleResult = document.getElementById("scale-result");
 const startCaptureBtn = document.getElementById("start-capture");
 const captureFrameBtn = document.getElementById("capture-frame");
+const recordPanBtn = document.getElementById("record-pan");
+const stopPanBtn = document.getElementById("stop-pan");
+const panStatus = document.getElementById("pan-status");
+const errorBoundEl = document.getElementById("error-bound");
 const captureResult = document.getElementById("capture-result");
 const rectifiedSection = document.getElementById("step-rectified");
 const rectifiedCanvas = document.getElementById("rectified");
@@ -212,6 +218,57 @@ async function startCapture(wasm, version, isolated) {
     }
   });
 
+  // Recorded pan (issue #4): frames are fed to the PanRecorder during
+  // capture; the core keeps only sharp, well-spaced keyframes, so a long
+  // pan never buffers more than the capped keyframe set.
+  recordPanBtn.hidden = false;
+  recordPanBtn.addEventListener("click", () => {
+    try {
+      pan.recorder = new PanRecorder(width, height);
+    } catch (err) {
+      showPanStatus("warn", "Could not start the pan recorder: " + errMsg(err));
+      return;
+    }
+    pan.recording = true;
+    recordPanBtn.hidden = true;
+    captureFrameBtn.disabled = true;
+    stopPanBtn.hidden = false;
+    showPanStatus("ok", "Recording — pan slowly from Marker A to Marker B. Keyframes kept: 1");
+  });
+  stopPanBtn.addEventListener("click", () => {
+    if (!pan.recorder) return;
+    pan.recording = false;
+    stopPanBtn.hidden = true;
+    // Claim the recorder synchronously: a second activation in the paint
+    // window below must find null here, not schedule a double-finish.
+    const recorder = pan.recorder;
+    pan.recorder = null;
+    const kept = recorder.keyframe_count();
+    showPanStatus("ok", `Processing ${kept} keyframes (tracking, chaining, loop closure)…`);
+    // Let the status paint before the synchronous WASM processing blocks
+    // the main thread (single-threaded v1; a worker is a later slice).
+    setTimeout(() => {
+      try {
+        const image = recorder.finish(session.printScale.correctionFactor);
+        try {
+          showPanResult(wasm, image);
+        } finally {
+          image.free();
+        }
+      } catch (err) {
+        showPanStatus(
+          "warn",
+          "Pan processing failed: " + errMsg(err) +
+            " You can record another pan or use single-frame capture.",
+        );
+      } finally {
+        recorder.free();
+        recordPanBtn.hidden = false;
+        captureFrameBtn.disabled = false;
+      }
+    }, 50);
+  });
+
   let frames = 0;
   let fpsWindowStart = performance.now();
 
@@ -241,6 +298,21 @@ async function startCapture(wasm, version, isolated) {
       frame.data,
     );
     processor.process();
+
+    if (pan.recording && pan.recorder) {
+      new Uint8Array(wasm.memory.buffer, pan.recorder.input_ptr(), frameLen).set(
+        frame.data,
+      );
+      pan.recorder.push_frame();
+      const kept = pan.recorder.keyframe_count();
+      if (kept !== pan.lastKept) {
+        pan.lastKept = kept;
+        showPanStatus(
+          "ok",
+          `Recording — pan slowly from Marker A to Marker B. Keyframes kept: ${kept}`,
+        );
+      }
+    }
     const out = new Uint8ClampedArray(
       wasm.memory.buffer,
       processor.output_ptr(),
@@ -286,7 +358,37 @@ const rectified = {
   imageData: null, // base pixels, redrawn under the measure overlay
   mmPerPx: 0,
   points: [], // up to two [x, y] in canvas px
+  // Pan results only: sampled per-position Error Bound component, so each
+  // measurement can show its own 95% distance bound. Null for still
+  // captures (no Error Bound yet — see issue #17).
+  bound: null,
 };
+
+/** Conservative bound component (mm) at a canvas x, from the samples. */
+function boundComponentAt(canvasX) {
+  const b = rectified.bound;
+  const wallX = b.originXMm + canvasX * rectified.mmPerPx;
+  const t = (wallX - b.originXMm) / b.stepMm;
+  const i0 = Math.max(0, Math.min(b.samples.length - 1, Math.floor(t)));
+  const i1 = Math.max(0, Math.min(b.samples.length - 1, Math.ceil(t)));
+  return Math.max(b.samples[i0], b.samples[i1]);
+}
+
+// Recorded-pan state (issue #4).
+const pan = {
+  recorder: null,
+  recording: false,
+  lastKept: 0,
+};
+
+function errMsg(err) {
+  return err && err.message ? err.message : String(err);
+}
+
+function showPanStatus(kind, message) {
+  panStatus.className = `result ${kind}`;
+  panStatus.textContent = message;
+}
 
 function showCaptureResult(kind, message) {
   captureResult.className = `result ${kind}`;
@@ -336,9 +438,14 @@ function updateMeasureReadout() {
   }
   const [[x1, y1], [x2, y2]] = rectified.points;
   const distMm = Math.hypot(x2 - x1, y2 - y1) * rectified.mmPerPx;
+  // Pan results carry the sampled bound: this measurement's own 95%
+  // distance bound is the sum of its two endpoint components.
+  const boundText = rectified.bound
+    ? ` ± ${(boundComponentAt(x1) + boundComponentAt(x2)).toFixed(0)} mm (95%)`
+    : "";
   measureResult.className = "result ok";
   measureResult.textContent =
-    `Distance: ${distMm.toFixed(1)} mm (${(distMm / 10).toFixed(1)} cm). ` +
+    `Distance: ${distMm.toFixed(1)} mm${boundText} (${(distMm / 10).toFixed(1)} cm). ` +
     "Check it against your tape measure. Tap again to restart.";
 }
 
@@ -359,6 +466,109 @@ function wireMeasureTool() {
     clearMeasureBtn.hidden = false;
   });
   clearMeasureBtn.addEventListener("click", clearMeasurePoints);
+}
+
+/**
+ * Display the stitched full-wall Rectified Wall Image from a processed pan
+ * and arm the (unchanged) two-point measure tool on it. The Error Bound is
+ * shown per wall end — the far end of a chained pan is honestly less
+ * certain than the metre around Marker A.
+ */
+function showPanResult(wasm, image) {
+  const width = image.width();
+  const height = image.height();
+  const pixels = new Uint8ClampedArray(
+    wasm.memory.buffer,
+    image.pixels_ptr(),
+    image.pixels_len(),
+  );
+  rectifiedCanvas.width = width;
+  rectifiedCanvas.height = height;
+  rectified.imageData = new ImageData(pixels.slice(), width, height);
+  rectified.mmPerPx = image.mm_per_px();
+  rectified.points = [];
+
+  const closure = image.closure_applied();
+  const closureRejected = image.closure_rejected();
+  const keyframes = image.keyframes_used();
+  const truncated = image.truncated();
+  const linkInliers = Array.from(image.link_inliers());
+  const originXMm = image.origin_x_mm();
+  const farXMm = image.far_x_mm();
+
+  // Sample the per-position bound component across the rendered extent
+  // BEFORE the WASM object is freed, so the measure tool can show every
+  // measurement's own distance bound (sum of its two endpoint components;
+  // that sum is the validated 95% contract).
+  const BOUND_SAMPLES = 256;
+  const boundStepMm = (width * rectified.mmPerPx) / (BOUND_SAMPLES - 1);
+  const boundSamples = new Float64Array(BOUND_SAMPLES);
+  for (let i = 0; i < BOUND_SAMPLES; i++) {
+    boundSamples[i] = image.error_bound_mm_at(originXMm + i * boundStepMm);
+  }
+  rectified.bound = { originXMm, stepMm: boundStepMm, samples: boundSamples };
+
+  const nearSpanMm = image.error_bound_between_mm(0, 300);
+  const fullSpanMm = image.error_bound_between_mm(0, farXMm);
+
+  const meta = recordPanResult({
+    widthPx: width,
+    heightPx: height,
+    mmPerPx: rectified.mmPerPx,
+    originXMm,
+    originYMm: image.origin_y_mm(),
+    keyframesUsed: keyframes,
+    truncated,
+    closureApplied: closure,
+    closureRejected,
+    closureDiscrepancyMm: image.closure_discrepancy_mm(),
+    closureResidualMm: image.closure_residual_mm(),
+    scaleCorrection: image.closure_scale_correction(),
+    errorBoundNearMm: image.error_bound_near_mm(),
+    errorBoundFarMm: image.error_bound_far_mm(),
+    errorBoundWorstMm: image.error_bound_worst_mm(),
+    errorBoundNearSpanMm: nearSpanMm,
+    errorBoundFullSpanMm: fullSpanMm,
+    linkInliers,
+  });
+
+  drawMeasureOverlay();
+  rectifiedSection.hidden = false;
+  updateMeasureReadout();
+
+  errorBoundEl.className = "result ok";
+  errorBoundEl.textContent =
+    `Error Bound (95%, on distances): ±${nearSpanMm.toFixed(0)} mm for a short ` +
+    `span near Marker A, ±${fullSpanMm.toFixed(0)} mm across the full wall. ` +
+    "Each measurement below shows its own bound. " +
+    (closure
+      ? `Loop closed against Marker B (drift measured: ` +
+        `${meta ? meta.closureDiscrepancyMm.toFixed(1) : "?"} mm, redistributed).`
+      : "Marker B could not be used to close the loop, so scale drift is " +
+        "bounded by a prior, not a measurement — treat far-end values with care.");
+  if (closureRejected) {
+    errorBoundEl.className = "result warn";
+    errorBoundEl.textContent +=
+      " A Marker B sighting had to be REJECTED (implausible drift — usually a " +
+      "blurred marker, a rotate-in-place sweep, or a marker off the wall " +
+      "plane). Re-record walking parallel to the wall with both markers sharp.";
+  }
+
+  const weakest = linkInliers.length ? Math.min(...linkInliers) : 0;
+  let summary =
+    `Full-wall Rectified Wall Image stitched from ${keyframes} keyframes ` +
+    `(${linkInliers.length} tracked links, weakest ${weakest} agreeing points): ` +
+    `${width}×${height} px at ${rectified.mmPerPx.toFixed(2)} mm/px. Scroll down to measure.`;
+  showPanStatus("ok", summary);
+  if (truncated) {
+    showPanStatus(
+      "warn",
+      summary +
+        " The keyframe limit was reached before you stopped — the far end of " +
+        "the pan may be missing. Consider re-recording with a steadier, shorter sweep.",
+    );
+  }
+  rectifiedSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 /**
@@ -390,6 +600,7 @@ function captureFrame(wasm, processor) {
     rectified.imageData = new ImageData(pixels.slice(), width, height);
     rectified.mmPerPx = image.mm_per_px();
     rectified.points = [];
+    rectified.bound = null; // stills have no Error Bound yet (issue #17)
 
     const markerIds = Array.from(image.marker_ids());
     const secondMarkerRejected = image.second_marker_rejected();
@@ -408,6 +619,9 @@ function captureFrame(wasm, processor) {
     drawMeasureOverlay();
     rectifiedSection.hidden = false;
     updateMeasureReadout();
+    // A single still has no chained Error Bound; don't leave a stale one up.
+    errorBoundEl.className = "result";
+    errorBoundEl.textContent = "";
     const markerNames = markerIds.map((id) => (id === 0 ? "A" : "B")).join(" + ");
     // With one marker the 4-point fit is exact by construction: a residual
     // of 0.00 px says nothing about capture quality, so don't present it as

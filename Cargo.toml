@@ -2,6 +2,12 @@
 resolver = "2"
 members = ["crates/geometry-core", "crates/marker-pdf"]
 
+# The synthetic CI tests (still + pan sequences) render and process millions
+# of pixels; unoptimized test builds turn seconds into minutes. Debug
+# assertions stay on.
+[profile.test]
+opt-level = 2
+
 [profile.release]
 opt-level = "s"
 lto = true

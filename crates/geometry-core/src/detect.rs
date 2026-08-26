@@ -228,7 +228,11 @@ fn trace_contour(
         }
         contour.push(cur);
         if contour.len() > cap {
-            break; // pathological; bail out
+            // Pathological component (e.g. a serpentine texture region whose
+            // boundary is far longer than any marker's). A truncated contour
+            // is not a valid closed boundary — handing it to fit_quad could
+            // fit a "quad" through an arbitrary partial walk. Reject outright.
+            return Vec::new();
         }
     }
     contour
@@ -602,4 +606,35 @@ fn intersect_lines(l1: [f64; 3], l2: [f64; 3]) -> Option<[f64; 2]> {
 pub fn marker_unit_homography(m: &DetectedMarker) -> Option<Homography> {
     let unit = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
     dlt(&unit, &m.corners)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trace_contour;
+
+    #[test]
+    fn overlong_contour_is_rejected_not_truncated() {
+        // A 1-px-wide serpentine: its area passes the component filters but
+        // its boundary is ~2x the pixel count — far beyond the tracer's cap.
+        // The old code broke out of the loop and returned the truncated walk;
+        // it must instead return an empty (rejected) contour.
+        let (w, h) = (96usize, 96usize);
+        let mut labels = vec![0u32; w * h];
+        for y in (0..h).step_by(2) {
+            for x in 0..w {
+                labels[y * w + x] = 1; // horizontal runs
+            }
+            // Connect alternating ends to the next run.
+            if y + 1 < h {
+                let x = if (y / 2) % 2 == 0 { w - 1 } else { 0 };
+                labels[(y + 1) * w + x] = 1;
+            }
+        }
+        let contour = trace_contour(&labels, w, h, 1, 0, 0);
+        assert!(
+            contour.is_empty(),
+            "overlong contour must be rejected, got {} truncated points",
+            contour.len()
+        );
+    }
 }

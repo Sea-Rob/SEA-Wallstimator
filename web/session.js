@@ -17,6 +17,10 @@ function blankState() {
     // metric scale plus the marker reprojection residuals that will seed
     // the Error Bound. Pixels stay on the canvas; re-capturing replaces it.
     rectified: null,
+    // Result of the latest recorded pan (issue #4): keyframes kept, loop
+    // closure status and the session's Error Bound. Pixels stay on the
+    // canvas; re-recording replaces it.
+    pan: null,
   };
 }
 
@@ -71,6 +75,62 @@ export function recordRectifiedWallImage({
     inliers,
   });
   return session.rectified;
+}
+
+/**
+ * Store the result of a processed recorded pan (issue #4): the full-wall
+ * Rectified Wall Image's metric metadata, the keyframes kept, loop-closure
+ * status and the session's Error Bound. Requires a locked print scale for
+ * the same reason as the still record.
+ */
+export function recordPanResult({
+  widthPx,
+  heightPx,
+  mmPerPx,
+  originXMm,
+  originYMm,
+  keyframesUsed,
+  truncated,
+  closureApplied,
+  closureRejected,
+  closureDiscrepancyMm,
+  closureResidualMm,
+  scaleCorrection,
+  errorBoundNearMm,
+  errorBoundFarMm,
+  errorBoundWorstMm,
+  errorBoundNearSpanMm,
+  errorBoundFullSpanMm,
+  linkInliers,
+}) {
+  if (!session.printScale || !session.captureStarted) {
+    return null;
+  }
+  session.pan = Object.freeze({
+    widthPx,
+    heightPx,
+    mmPerPx,
+    originXMm,
+    originYMm,
+    keyframesUsed,
+    truncated: Boolean(truncated),
+    closureApplied: Boolean(closureApplied),
+    // Marker B was seen but its closure was refused (implausible drift):
+    // the result is open-loop and the Homeowner was told to retake.
+    closureRejected: Boolean(closureRejected),
+    closureDiscrepancyMm,
+    closureResidualMm,
+    scaleCorrection,
+    // Per-position components (see pan.rs: not standalone 95% bounds).
+    errorBoundNearMm,
+    errorBoundFarMm,
+    errorBoundWorstMm,
+    // THE 95% distance-bound contract, at two representative spans.
+    errorBoundNearSpanMm,
+    errorBoundFullSpanMm,
+    linkInliers: Object.freeze(Array.from(linkInliers ?? [])),
+  });
+  return session.pan;
 }
 
 export function hasVerifiedPrintScale() {
