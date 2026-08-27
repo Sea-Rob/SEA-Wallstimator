@@ -682,6 +682,9 @@ const bounds = {
   view: null, // zoom/pan transform image->view (wall-bounds.js shape)
   minGapPx: 0,
   confirmed: false,
+  // The Floor Line pre-placement is a guess; Confirm stays disabled until
+  // the Homeowner has grabbed the floor guide at least once.
+  floorEngaged: false,
   pointers: new Map(), // active pointerId -> [x, y] view px
   mode: null, // {type:"drag", guide} | {type:"pan"} | {type:"pinch"}
 };
@@ -774,7 +777,11 @@ function drawBounds() {
 
 /** Live width × height readout while placing, mm readback once confirmed. */
 function updateBoundsGate() {
-  confirmBoundsBtn.disabled = !bounds.meta || bounds.confirmed;
+  // The Floor Line pre-placement is a GUESS (90% of image height): the
+  // vertical datum for every later height must never be confirmable
+  // untouched, so Confirm stays disabled until it has been grabbed at
+  // least once (review finding on issue #7).
+  confirmBoundsBtn.disabled = !bounds.meta || bounds.confirmed || !bounds.floorEngaged;
   resetGuidesBtn.disabled = !bounds.meta;
   if (!bounds.meta) return;
   if (bounds.confirmed && session.wallBounds) {
@@ -796,9 +803,12 @@ function updateBoundsGate() {
       `Current guides: ${(mm.rightXMm - mm.leftXMm).toFixed(0)} mm wide × ` +
       `${(mm.floorYMm - mm.topYMm).toFixed(0)} mm from the Floor Line to the top edge.`;
     boundsGate.className = "result warn";
-    boundsGate.textContent =
-      "Not confirmed yet — the following steps stay locked until you place " +
-      "the guides and press Confirm.";
+    boundsGate.textContent = bounds.floorEngaged
+      ? "Not confirmed yet — the following steps stay locked until you place " +
+        "the guides and press Confirm."
+      : "Drag the amber Floor Line to where the wall meets the floor — it is " +
+        "the datum every height is measured from, so Confirm stays disabled " +
+        "until you have placed it.";
   }
 }
 
@@ -848,6 +858,7 @@ function showBoundsStep(meta) {
     meta.heightPx / 4,
   );
   bounds.confirmed = false;
+  bounds.floorEngaged = false;
   bounds.pointers.clear();
   bounds.mode = null;
   boundsSection.hidden = false;
@@ -878,6 +889,12 @@ function wireBoundsStep() {
       const p = bounds.pointers.get(event.pointerId);
       const guide = hitGuide(bounds.guides, bounds.view, p, HANDLE_SLOP_CSS_PX * boundsUnit());
       bounds.mode = guide ? { type: "drag", guide } : { type: "pan" };
+      if (guide === "floor" && !bounds.floorEngaged) {
+        // Grabbing the Floor Line counts as engaging with it (even a grab
+        // that ends where it started is a deliberate aim at the datum).
+        bounds.floorEngaged = true;
+        updateBoundsGate();
+      }
     }
   });
 
@@ -891,7 +908,14 @@ function wireBoundsStep() {
 
     if (bounds.mode?.type === "pinch" && bounds.pointers.size >= 2) {
       const ids = [...bounds.pointers.keys()].slice(0, 2);
-      if (!ids.includes(event.pointerId)) return; // ignore a stray 3rd finger
+      if (!ids.includes(event.pointerId)) {
+        // Stray 3rd finger: not part of the pinch, but keep its stored
+        // position fresh — if a tracked finger lifts, this one may be
+        // promoted into the pinch pair and a stale position would inject
+        // one frame of garbage delta.
+        bounds.pointers.set(event.pointerId, p);
+        return;
+      }
       const before = ids.map((id) => bounds.pointers.get(id));
       bounds.pointers.set(event.pointerId, p);
       const after = ids.map((id) => bounds.pointers.get(id));
@@ -904,7 +928,7 @@ function wireBoundsStep() {
     if (bounds.mode?.type === "drag") {
       const [ix, iy] = viewToImage(bounds.view, p);
       const alongX = bounds.mode.guide === "left" || bounds.mode.guide === "right";
-      bounds.guides = moveGuide(
+      const moved = moveGuide(
         bounds.guides,
         bounds.mode.guide,
         alongX ? ix : iy,
@@ -912,9 +936,15 @@ function wireBoundsStep() {
         m.heightPx,
         bounds.minGapPx,
       );
-      unconfirmBounds();
-      drawBounds();
-      updateBoundsGate();
+      // Only a drag that actually changed a value invalidates a prior
+      // confirmation: a tap's pixel of jitter, or a drag fully absorbed by
+      // clamping, leaves the confirmed record still describing the screen.
+      if (moved[bounds.mode.guide] !== bounds.guides[bounds.mode.guide]) {
+        bounds.guides = moved;
+        unconfirmBounds();
+        drawBounds();
+        updateBoundsGate();
+      }
     } else if (bounds.mode?.type === "pan") {
       bounds.view = panBy(bounds.view, p[0] - prev[0], p[1] - prev[1], m.widthPx, m.heightPx, vw, vh);
       drawBounds();
@@ -938,6 +968,9 @@ function wireBoundsStep() {
     (event) => {
       if (!bounds.image) return;
       event.preventDefault();
+      // Horizontal trackpad scrolls deliver deltaY 0 — that is not a zoom
+      // request in either direction.
+      if (event.deltaY === 0) return;
       const m = bounds.meta;
       bounds.view = zoomAt(
         bounds.view,
@@ -958,6 +991,9 @@ function wireBoundsStep() {
     if (!bounds.meta) return;
     bounds.guides = initialGuides(bounds.meta.widthPx, bounds.meta.heightPx);
     bounds.view = fitTransform(bounds.meta.widthPx, bounds.meta.heightPx, boundsCanvas.width, boundsCanvas.height);
+    // Back to the guessed defaults — the Floor Line must be re-engaged
+    // before Confirm re-enables.
+    bounds.floorEngaged = false;
     unconfirmBounds();
     drawBounds();
     updateBoundsGate();

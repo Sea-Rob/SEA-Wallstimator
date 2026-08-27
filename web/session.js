@@ -188,6 +188,21 @@ export function recordWallBounds({ leftXMm, rightXMm, topYMm, floorYMm, source }
   if (!values.every(Number.isFinite) || rightXMm <= leftXMm || floorYMm <= topYMm) {
     return null;
   }
+  // Containment cross-check against the source image's own extent (review
+  // hardening): the UI clamps guides to the image, so bounds outside it can
+  // only come from a buggy caller — refuse rather than store coordinates
+  // the image cannot substantiate. Half a pixel of slack absorbs rounding.
+  const slackMm = image.mmPerPx / 2;
+  const maxXMm = image.originXMm + image.widthPx * image.mmPerPx;
+  const maxYMm = image.originYMm + image.heightPx * image.mmPerPx;
+  if (
+    leftXMm < image.originXMm - slackMm ||
+    rightXMm > maxXMm + slackMm ||
+    topYMm < image.originYMm - slackMm ||
+    floorYMm > maxYMm + slackMm
+  ) {
+    return null;
+  }
   session.wallBounds = Object.freeze({
     leftXMm,
     rightXMm,
