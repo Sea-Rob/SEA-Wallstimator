@@ -405,9 +405,9 @@ const pan = {
 };
 
 // Live-coaching cues (issue #5): the core resolves the single
-// highest-priority tripping check (lost marker > too fast > exposure >
-// rotation) to one code; this page only renders the words. Codes match
-// geometry-core's pan::CoachCue.
+// highest-priority tripping check (lost marker > too fast > exposure) to
+// one code; this page only renders the words. Codes match geometry-core's
+// pan::CoachCue.
 const COACH_MESSAGES = {
   0: ["ok", "Looking good — keep panning slowly toward Marker B."],
   1: ["warn", "Start with Marker A fully in view."],
@@ -415,7 +415,6 @@ const COACH_MESSAGES = {
   3: ["warn", "Slow down — pan more slowly so the frames stay sharp."],
   4: ["warn", "Too dark — turn on a light."],
   5: ["warn", "Too bright — the image is washing out. Avoid aiming at direct light."],
-  6: ["warn", "Keep walking along the wall — don't stand in place and swivel."],
 };
 
 function showCoach(cue) {
@@ -431,9 +430,12 @@ function hideCoach() {
 
 /**
  * End-of-recording gate (issue #5): a recording that never saw both
- * Reference Markers — or was mostly blurred/untrackable — gets an immediate
- * retake prompt with the reason INSTEAD of processing. Returns the reason,
- * or null when the recording is worth processing.
+ * Reference Markers, whose tracking the core already knows broke mid-pan,
+ * or that was mostly blurred/untrackable, gets an immediate retake prompt
+ * with the reason INSTEAD of processing. Returns the reason, or null when
+ * the recording is worth processing. (A weak tracking segment can still
+ * surface only after processing — the core cannot know link quality until
+ * full-resolution matching runs.)
  */
 function retakeReason(recorder) {
   const aSeen = recorder.marker_a_seen();
@@ -446,6 +448,11 @@ function retakeReason(recorder) {
   }
   if (!bSeen) {
     return "Marker B was never seen. Keep panning until Marker B (right end) is fully in view before stopping.";
+  }
+  // The core knows for certain that processing would fail with the same
+  // fact: refuse now, not after the wait.
+  if (recorder.tracking_lost()) {
+    return "tracking was lost mid-pan (the camera moved too fast, or crossed a stretch with nothing to track), so the recording cannot be stitched. Pan again, slowly and steadily.";
   }
   const blurFraction = recorder.blur_fraction();
   if (blurFraction > 0.5) {

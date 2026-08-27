@@ -1,16 +1,18 @@
 //! Live capture coaching (issue #5): deterministic synthetic-fixture tests
 //! for the per-frame checks that run alongside keyframe selection. Marker
-//! and rotation scenarios render real scenes through the synthetic camera;
-//! speed/exposure scenarios use cheap procedurally-dotted frames (no marker
+//! scenarios render real scenes through the synthetic camera; speed and
+//! exposure scenarios use cheap procedurally-dotted frames (no marker
 //! needed for those checks, and rendering stays fast).
 
+use geometry_core::detect::detect_markers;
 use geometry_core::pan::{
-    CoachCue, CoachStatus, PanCore, COACH_BLOWN_OUT, COACH_MARKER_LOST,
-    COACH_MARKER_STALE_FRAMES, COACH_NO_MARKER, COACH_ROTATION, COACH_TOO_DARK, COACH_TOO_FAST,
+    CoachCue, CoachStatus, PanCore, PanError, COACH_BLOWN_OUT, COACH_MARKER_LOST,
+    COACH_MARKER_STALE_FRAMES, COACH_NO_MARKER, COACH_TOO_DARK, COACH_TOO_FAST,
 };
 use geometry_core::synthetic::{
     pose_homography, render_scene, PanCamera, Scene, SyntheticMarker,
 };
+use geometry_core::grayscale;
 
 const W: usize = 480;
 const H: usize = 270;
@@ -77,24 +79,22 @@ fn flags_of(core: &PanCore) -> u8 {
 // Cue priority (unit-level: pure function of the status flags).
 
 #[test]
-fn cue_priority_is_marker_then_speed_then_exposure_then_rotation() {
+fn cue_priority_is_lost_marker_then_speed_then_exposure() {
     let s = |flags: u8| CoachStatus { flags, ..Default::default() };
     assert_eq!(s(0).cue(), CoachCue::AllGood);
     let all = COACH_NO_MARKER
         | COACH_MARKER_LOST
         | COACH_TOO_FAST
         | COACH_TOO_DARK
-        | COACH_BLOWN_OUT
-        | COACH_ROTATION;
+        | COACH_BLOWN_OUT;
     assert_eq!(s(all).cue(), CoachCue::FindMarkerA);
     assert_eq!(s(all & !COACH_NO_MARKER).cue(), CoachCue::MarkerLost);
     assert_eq!(
-        s(COACH_TOO_FAST | COACH_TOO_DARK | COACH_BLOWN_OUT | COACH_ROTATION).cue(),
+        s(COACH_TOO_FAST | COACH_TOO_DARK | COACH_BLOWN_OUT).cue(),
         CoachCue::TooFast
     );
-    assert_eq!(s(COACH_TOO_DARK | COACH_BLOWN_OUT | COACH_ROTATION).cue(), CoachCue::TooDark);
-    assert_eq!(s(COACH_BLOWN_OUT | COACH_ROTATION).cue(), CoachCue::BlownOut);
-    assert_eq!(s(COACH_ROTATION).cue(), CoachCue::RotationDominant);
+    assert_eq!(s(COACH_TOO_DARK | COACH_BLOWN_OUT).cue(), CoachCue::TooDark);
+    assert_eq!(s(COACH_BLOWN_OUT).cue(), CoachCue::BlownOut);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,45 +281,133 @@ fn blown_out_scene_trips_blown_out() {
 }
 
 // ---------------------------------------------------------------------------
-// Rotation-dominant motion (issue #19: coached away).
+// blur_fraction is the share of MOTION frames (adversarial review,
+// DECISION 3 resolved as a bugfix).
 
 #[test]
-fn rotate_in_place_sweep_trips_rotation_cue() {
-    // Camera standing still in front of the wall, sweeping yaw 0 -> 35
-    // degrees — the very phone habit the closure guard refuses post-capture.
-    // Apparent motion stays under the speed threshold (~4-7 px/frame), so
-    // the ROTATION check — not TOO_FAST — must be the one that fires.
-    // Texture must cover everything the swivel sweeps across (the oblique
-    // view at 35 degrees reaches well past wall x = -1000): the probes need
-    // something to track, exactly as documented for the heuristic.
-    let scene = Scene {
-        markers: vec![marker(0, 0.0, 0.0)],
-        dots: spread_dots(-1800.0, 2600.0),
-    };
+fn fast_pan_then_long_standstill_still_fails_the_blur_gate() {
+    // Reviewer probe: 120 all-too-fast frames followed by 130 standing-still
+    // frames used to dilute blur_fraction to ~0.48 — the ≤ 0.5 retake gate
+    // passed a recording whose every MOVING frame was too fast. Standstill
+    // frames (tracked sub-pixel jitter) are not motion: they must count on
+    // neither side, leaving the ratio at ~1.0.
     let mut core = PanCore::new(W, H);
-    let frames = 80;
-    for i in 0..frames {
-        let t = i as f64 / (frames - 1) as f64;
-        let yaw = t * 35.0f64.to_radians();
-        let h = pose_homography(FOCAL, W, H, [600.0, 280.0, -DIST], yaw, 0.0);
-        let rgba = render_scene(&scene, &h, W, H, 2.5, 900 + i as u64);
-        core.push_frame(&rgba);
+    let mut offset = 0.0;
+    // ~22 px/frame at 480 wide: every moving frame is over the HI threshold.
+    for _ in 0..120 {
+        core.push_frame(&dotted_frame(W, H, offset, 205, 30));
+        offset += 22.0;
+    }
+    // Standing still: alternating sub-pixel hand jitter (frames differ
+    // byte-wise, so they are tracked — not duplicates — with a near-zero
+    // shift, exactly the "tracked jitter" the reviewer probed with).
+    for i in 0..130 {
+        let jitter = if i % 2 == 0 { 0.7 } else { 0.0 };
+        core.push_frame(&dotted_frame(W, H, offset + jitter, 205, 30));
     }
     let status = core.coach_status();
     assert!(
-        status.flags & COACH_ROTATION != 0,
-        "rotate-in-place must trip COACH_ROTATION (flags {:#b}, drift {:.3})",
-        status.flags,
-        status.rotation_drift
+        status.blur_fraction > 0.5,
+        "a fast pan followed by a long standstill is still a mostly-blurred \
+         recording and must fail the retake gate: blur_fraction {}",
+        status.blur_fraction
     );
-    assert_eq!(
-        status.flags & COACH_TOO_FAST,
-        0,
-        "the swivel is slow — TOO_FAST must not be the verdict (speed {:.1})",
-        status.speed_px_per_frame
+    assert!(
+        status.blur_fraction > 0.9,
+        "standstill frames must not dilute the ratio at all: blur_fraction {}",
+        status.blur_fraction
     );
-    // A was seen at the start and the sweep is shorter than the staleness
-    // window, so rotation is the highest-priority active cue.
-    assert_eq!(status.cue(), CoachCue::RotationDominant);
+}
+
+// ---------------------------------------------------------------------------
+// Coach marker detection floor == processing detection floor (adversarial
+// review, MUST-FIX 2).
+
+#[test]
+fn coach_marker_detection_floor_matches_full_res_processing_floor() {
+    // The coach used to detect on a 2×2-downscaled plane, so it lost a
+    // marker that finish()'s full-resolution detection could still find —
+    // and the retake gate then refused processable captures. Parity is
+    // asserted STRUCTURALLY: across a range of apparent marker scales, the
+    // coach's sticky seen-flag after pushing a frame must equal
+    // detect_markers() on the very same full-resolution frame. The probed
+    // range must straddle the detection floor, so the equality is exercised
+    // on both sides of it.
+    let scene = Scene {
+        markers: vec![marker(0, 0.0, 0.0)],
+        dots: spread_dots(250.0, 900.0),
+    };
+    let mut seen_any = false;
+    let mut missed_any = false;
+    for dist in [1200.0f64, 1800.0, 2400.0, 3000.0, 3600.0, 4200.0, 4800.0, 5400.0, 6600.0] {
+        // Marker centred in frame; apparent side = FOCAL * 150 / dist.
+        let h = pose_homography(FOCAL, W, H, [75.0, 75.0, -dist], 0.0, 0.0);
+        let rgba = render_scene(&scene, &h, W, H, 2.5, 7000 + dist as u64);
+        let mut gray = vec![0u8; W * H];
+        grayscale(&rgba, &mut gray);
+        let full_res = detect_markers(&gray, W, H).iter().any(|m| m.id == 0);
+        let mut core = PanCore::new(W, H);
+        core.push_frame(&rgba); // frame 0 always runs the coach's detection
+        let coach = core.coach_status().marker_a_seen;
+        assert_eq!(
+            coach, full_res,
+            "coach seen-flag must equal full-res detection at distance {dist} mm \
+             (apparent side {:.1} px, full-res detected: {full_res})",
+            FOCAL * 150.0 / dist
+        );
+        seen_any |= full_res;
+        missed_any |= !full_res;
+    }
+    assert!(
+        seen_any && missed_any,
+        "probed distances must straddle the detection floor \
+         (seen_any {seen_any}, missed_any {missed_any}) — widen the range"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tracking lost mid-pan is certain knowledge at stop time (adversarial
+// review, DECISION 4): the retake gate refuses immediately instead of
+// letting finish() fail with the same fact after a processing wait.
+
+/// Featureless flat frame: nothing for the thumbnail tracker to correlate.
+fn flat_frame(w: usize, h: usize, v: u8) -> Vec<u8> {
+    let mut rgba = vec![v; w * h * 4];
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    rgba
+}
+
+#[test]
+fn tracking_broken_mid_pan_is_known_at_stop_time() {
+    let mut core = PanCore::new(W, H);
+    let mut offset = 0.0;
+    // Trackable pan...
+    for _ in 0..30 {
+        core.push_frame(&dotted_frame(W, H, offset, 205, 30));
+        offset += 6.0;
+    }
+    assert!(!core.tracking_broken(), "a clean pan must not read as broken");
+    // ...then an untrackable stretch longer than the lost-track window...
+    for _ in 0..15 {
+        core.push_frame(&flat_frame(W, H, 205));
+    }
+    // ...then trackable wall again, long enough to commit keyframes beyond
+    // the gap (which is what makes the break certain).
+    offset += 400.0;
+    for _ in 0..40 {
+        core.push_frame(&dotted_frame(W, H, offset, 205, 30));
+        offset += 6.0;
+    }
+    assert!(
+        core.tracking_broken(),
+        "keyframes committed beyond an untrackable gap must be known-broken at stop time"
+    );
+    // The flag must agree exactly with what finish() would do.
+    assert!(
+        matches!(core.finish(1.0, true), Err(PanError::TrackingLost { .. })),
+        "finish() must fail with the same fact the stop-time flag reported"
+    );
 }
 

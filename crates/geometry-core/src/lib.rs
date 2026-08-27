@@ -344,15 +344,15 @@ impl PanRecorder {
 
     /// Live-coaching flag bitmask as of the last pushed frame (issue #5):
     /// 1 no marker seen yet, 2 marker sighting stale, 4 too fast, 8 too
-    /// dark, 16 blown out, 32 rotation-dominant motion. Flags are debounced
-    /// in the core; see [`pan::CoachStatus`].
+    /// dark, 16 blown out. Flags are debounced in the core; see
+    /// [`pan::CoachStatus`].
     pub fn coach_flags(&self) -> u8 {
         self.core.coach_status().flags
     }
 
     /// The single highest-priority coaching cue for the one-message UI line:
     /// 0 all good, 1 find Marker A, 2 marker lost, 3 too fast, 4 too dark,
-    /// 5 blown out, 6 rotation-dominant ("keep walking — don't swivel").
+    /// 5 blown out.
     pub fn coach_cue(&self) -> u8 {
         self.core.coach_status().cue() as u8
     }
@@ -368,10 +368,22 @@ impl PanRecorder {
         self.core.coach_status().marker_b_seen
     }
 
-    /// Fraction of motion frames that were untrackable or over the speed
-    /// limit — the "mostly blurred" retake signal.
+    /// Fraction of MOTION frames that were untrackable or over the speed
+    /// limit — the "mostly blurred" retake signal. Standing-still frames
+    /// (tracked jitter below the real-motion floor) count on neither side.
     pub fn blur_fraction(&self) -> f64 {
         self.core.coach_status().blur_fraction
+    }
+
+    /// True when the core already knows post-capture processing must fail
+    /// with tracking-lost (continuity broke mid-recording and keyframes
+    /// were committed beyond the gap): the page's retake gate refuses
+    /// immediately at stop time instead of making the Homeowner wait for
+    /// [`PanRecorder::finish`] to fail with the same fact. A weak segment
+    /// can still surface only at processing time (see
+    /// [`pan::PanCore::tracking_broken`]).
+    pub fn tracking_lost(&self) -> bool {
+        self.core.tracking_broken()
     }
 
     /// Run the full post-capture pipeline (tracking, chaining, loop closure,
