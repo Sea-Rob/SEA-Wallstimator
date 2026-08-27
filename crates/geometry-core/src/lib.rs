@@ -16,6 +16,7 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod calib;
 pub mod detect;
 pub mod homography;
 pub mod linalg;
@@ -479,6 +480,28 @@ impl PanWallImage {
     /// Scale correction the redistribution applied at the far end.
     pub fn closure_scale_correction(&self) -> f64 {
         self.out.closure.as_ref().map_or(1.0, |c| c.scale_correction)
+    }
+
+    /// True when self-calibrated intrinsics (issue #6: shared focal + k1
+    /// radial distortion, refined jointly with the keyframe homographies)
+    /// passed the conditioning gates and were applied to this result. False
+    /// = honest pinhole fallback (short / barely-rotating / fronto-parallel
+    /// chains cannot support self-calibration; see `calib` module docs) —
+    /// the page must say "uncalibrated", never invent a focal.
+    pub fn calibrated(&self) -> bool {
+        self.out.calibration.is_some()
+    }
+
+    /// Self-calibrated focal length (px at processing resolution); 0.0 when
+    /// uncalibrated — gate on [`PanWallImage::calibrated`] first.
+    pub fn calibrated_focal_px(&self) -> f64 {
+        self.out.calibration.as_ref().map_or(0.0, |c| c.focal_px)
+    }
+
+    /// Self-calibrated division-model k1 (dimensionless, radius normalized
+    /// by the half frame diagonal; barrel < 0); 0.0 when uncalibrated.
+    pub fn calibrated_k1(&self) -> f64 {
+        self.out.calibration.as_ref().map_or(0.0, |c| c.k1)
     }
 
     /// Per-position Error Bound component (mm) at wall x mm from Marker A's
