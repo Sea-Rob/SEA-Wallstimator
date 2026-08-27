@@ -100,6 +100,43 @@ pub fn render_scene(
     seed: u64,
 ) -> Vec<u8> {
     let h_inv = Homography(mat3_inv(h_true).expect("h_true must be invertible"));
+    render_with(scene, width, height, noise_sigma, seed, |ix, iy| {
+        h_inv.apply(ix, iy)
+    })
+}
+
+/// Render the scene through `h_true` AND a real lens model (issue #6): the
+/// ideal pinhole projection is bent by division-model radial distortion, the
+/// same model the self-calibration estimates. Each output pixel lives in
+/// DISTORTED image coordinates; sampling undistorts the supersample position
+/// (closed form) before back-projecting to the wall, so projected points and
+/// rendered pixels are consistent: a wall point projected through `h_true`
+/// then bent by `dist.distort` lands exactly on its rendered image.
+pub fn render_scene_distorted(
+    scene: &Scene,
+    h_true: &[f64; 9],
+    width: usize,
+    height: usize,
+    noise_sigma: f64,
+    seed: u64,
+    dist: &crate::calib::Distortion,
+) -> Vec<u8> {
+    let h_inv = Homography(mat3_inv(h_true).expect("h_true must be invertible"));
+    render_with(scene, width, height, noise_sigma, seed, |ix, iy| {
+        let u = dist.undistort([ix, iy]);
+        h_inv.apply(u[0], u[1])
+    })
+}
+
+/// Shared supersampling render loop over a px -> wall-mm mapping.
+fn render_with(
+    scene: &Scene,
+    width: usize,
+    height: usize,
+    noise_sigma: f64,
+    seed: u64,
+    px_to_wall: impl Fn(f64, f64) -> Option<(f64, f64)>,
+) -> Vec<u8> {
     let mut rng = Lcg(seed);
     let mut rgba = vec![0u8; width * height * 4];
     for py in 0..height {
@@ -111,7 +148,7 @@ pub fn render_scene(
                 for sx in 0..3 {
                     let ix = px as f64 - 0.5 + (sx as f64 + 0.5) / 3.0;
                     let iy = py as f64 - 0.5 + (sy as f64 + 0.5) / 3.0;
-                    acc += match h_inv.apply(ix, iy) {
+                    acc += match px_to_wall(ix, iy) {
                         Some((wx, wy)) => scene_luma(scene, wx, wy),
                         None => 205.0,
                     };

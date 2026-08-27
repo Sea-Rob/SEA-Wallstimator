@@ -39,6 +39,24 @@
 //!    homographies, which are chained into wall->keyframe maps. Links with
 //!    too few, or too tightly clustered, inliers break the chain loudly
 //!    ([`PanError::WeakSegment`]).
+//! 3b. Self-calibration (issue #6, [`crate::calib`]): focal length and one
+//!    division-model radial-distortion coefficient (k1) are refined jointly
+//!    with the keyframe poses by LM over the same correspondences (marker
+//!    corners + tracked features). When the result passes the conditioning
+//!    gates, every measured point is undistorted and the anchor estimate,
+//!    links and chain are re-run on the corrected points — frame-edge
+//!    geometry stops bending, residuals drop, and with them the measured
+//!    terms of the Error Bound below (the bound tightens because its
+//!    inputs genuinely improved, not because a constant changed). When only
+//!    the focal gate fails (low-wobble chains pin k1 from radial bending
+//!    long before they pin the focal), the provable k1 AND the bundle's
+//!    chain are still applied — no focal is claimed
+//!    ([`crate::calib::CalibOutcome::DistortionOnly`]: the flat cost along
+//!    focal that failed the gate is exactly what makes the chain
+//!    insensitive to it); discarding a provable k1 was measured to leave
+//!    bounds that do NOT cover on distorted lenses. Only when nothing is
+//!    provable does the pipeline stay fully pinhole (k1 = 0) with the
+//!    wider uncalibrated bound.
 //! 4. Loop closure: Marker B's corners in its best keyframe are
 //!    back-projected through the chain onto the wall plane. Because B's wall
 //!    *pose* is unknown but its printed *size* is known (ADR-0002), the
@@ -91,6 +109,7 @@
 //! systematic-bias caveat; the far end of a wall is honestly less certain
 //! than the metre around Marker A.
 
+use crate::calib::{self, Distortion, SelfCalibration};
 use crate::detect::{detect_markers, DetectedMarker};
 use crate::homography::{estimate, Homography};
 use crate::linalg::{mat3_inv, mat3_mul};
@@ -749,8 +768,24 @@ impl PanCore {
     /// Run the full post-capture pipeline. `correction_factor` is the
     /// session print-scale factor (ADR-0002: MULTIPLY, never divide).
     /// `close_loop` exists so tests can prove the closure mechanism; the
-    /// production path always passes `true`.
+    /// production path always passes `true`. Self-calibration (issue #6)
+    /// is attempted; see [`PanCore::finish_with`] to force the pinhole
+    /// baseline.
     pub fn finish(&mut self, correction_factor: f64, close_loop: bool) -> Result<PanOutput, PanError> {
+        self.finish_with(correction_factor, close_loop, true)
+    }
+
+    /// [`PanCore::finish`] with the self-calibration stage switchable:
+    /// `calibrate = false` forces the pinhole (k1 = 0) path. Exists so tests
+    /// can compare the calibrated result against the uncalibrated baseline;
+    /// production always calibrates (the conditioning gates inside decide
+    /// whether the calibration is trustworthy).
+    pub fn finish_with(
+        &mut self,
+        correction_factor: f64,
+        close_loop: bool,
+        calibrate: bool,
+    ) -> Result<PanOutput, PanError> {
         if !(correction_factor.is_finite() && correction_factor > 0.0) {
             return Err(PanError::InvalidCorrectionFactor);
         }
@@ -783,6 +818,7 @@ impl PanCore {
             correction_factor,
             close_loop,
             self.truncated,
+            calibrate,
         )
     }
 }
@@ -1276,6 +1312,21 @@ pub struct PanOutput {
     /// a degenerate correction. The result fell back to open-loop and the
     /// UI must tell the Homeowner to retake rather than trust silence.
     pub closure_rejected: bool,
+    /// Self-calibrated intrinsics actually applied to this result (issue
+    /// #6): the shared focal + division-model k1 the joint LM certified,
+    /// with the curvature sigmas that certified them. `None` = pinhole
+    /// fallback — the chain could not support calibration (too short, too
+    /// fronto-parallel, too little rotation wobble) or the refinement did
+    /// not prove itself; the honest response is the wider uncalibrated
+    /// bound, never a garbage focal (see [`crate::calib`]).
+    pub calibration: Option<SelfCalibration>,
+    /// Division-model k1 actually applied to this result's geometry
+    /// (0.0 = pure pinhole). Set with `calibration` on the fully calibrated
+    /// path, and WITHOUT it on the distortion-only path
+    /// ([`crate::calib::CalibOutcome::DistortionOnly`]: k1 passed its gate,
+    /// the focal did not — distortion is corrected but no focal is
+    /// claimed).
+    pub applied_k1: f64,
     pub bound: BoundModel,
     /// Wall x (mm) of the anchor-nearest and far output edges — where the
     /// near/far bound scalars are evaluated.
@@ -1432,40 +1483,18 @@ fn quad_area(c: &[[f64; 2]; 4]) -> f64 {
     a.abs() * 0.5
 }
 
-#[allow(clippy::too_many_arguments)]
-fn process(
+/// Raw per-link correspondences: NCC feature matches plus shared marker
+/// corners, in measured (possibly lens-distorted) px. Collected once —
+/// both the pinhole pass and the calibrated re-estimation consume them.
+fn collect_link_matches(
     keyframes: &[Keyframe],
+    detections: &[Vec<DetectedMarker>],
     width: usize,
     height: usize,
-    correction_factor: f64,
-    close_loop: bool,
-    truncated: bool,
-) -> Result<PanOutput, PanError> {
+) -> Vec<(Vec<[f64; 2]>, Vec<[f64; 2]>)> {
     let n = keyframes.len();
-    let side_mm = MARKER_SIDE_MM * correction_factor;
-
-    // 1. Marker detection per keyframe.
-    let detections: Vec<Vec<DetectedMarker>> = keyframes
-        .iter()
-        .map(|kf| detect_markers(&kf.gray, width, height))
-        .collect();
     let find = |i: usize, id: u16| detections[i].iter().find(|m| m.id == id);
-
-    // 2. Anchor at the best Marker A detection.
-    let ka = (0..n)
-        .filter_map(|i| find(i, LEFT_MARKER_ID).map(|m| (i, quad_area(&m.corners))))
-        .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .ok_or(PanError::AnchorMarkerNotFound)?;
-    let marker_a = find(ka, LEFT_MARKER_ID).unwrap();
-    let world = anchor_corners_mm(side_mm);
-    let est_a = estimate(&world, &marker_a.corners, LINK_INLIER_THRESHOLD_PX)
-        .ok_or(PanError::AnchorEstimateFailed)?;
-
-    // 3. Per-link tracking: features + NCC matches + shared marker corners
-    //    through the RANSAC + LM estimator. links[i]: px_i -> px_{i+1}.
-    let mut links: Vec<Homography> = Vec::with_capacity(n.saturating_sub(1));
-    let mut link_quality: Vec<LinkQuality> = Vec::with_capacity(n.saturating_sub(1));
+    let mut out = Vec::with_capacity(n.saturating_sub(1));
     for i in 0..n.saturating_sub(1) {
         let (a, b) = (&keyframes[i], &keyframes[i + 1]);
         // Capture-time accumulated shift: seeds the full-res patch search.
@@ -1488,6 +1517,35 @@ fn process(
                 dst.extend_from_slice(&mb.corners);
             }
         }
+        out.push((src, dst));
+    }
+    out
+}
+
+struct LinkEstimates {
+    links: Vec<Homography>,
+    quality: Vec<LinkQuality>,
+    /// RANSAC-inlier correspondences in RAW measured px, evenly subsampled
+    /// to [`calib::CALIB_MATCHES_PER_LINK`] — the self-calibration bundle's
+    /// observations (it applies its own distortion model to raw points).
+    inliers_raw: Vec<(Vec<[f64; 2]>, Vec<[f64; 2]>)>,
+}
+
+/// Estimate all chain links from the raw matches, undistorting every point
+/// through `dist` first (exact identity when uncalibrated).
+/// links[i]: (ideal) px_i -> (ideal) px_{i+1}.
+fn estimate_links(
+    raw: &[(Vec<[f64; 2]>, Vec<[f64; 2]>)],
+    dist: &Distortion,
+    width: usize,
+    height: usize,
+) -> Result<LinkEstimates, PanError> {
+    let mut links: Vec<Homography> = Vec::with_capacity(raw.len());
+    let mut quality: Vec<LinkQuality> = Vec::with_capacity(raw.len());
+    let mut inliers_raw: Vec<(Vec<[f64; 2]>, Vec<[f64; 2]>)> = Vec::with_capacity(raw.len());
+    for (i, (src_raw, dst_raw)) in raw.iter().enumerate() {
+        let src: Vec<[f64; 2]> = src_raw.iter().map(|&p| dist.undistort(p)).collect();
+        let dst: Vec<[f64; 2]> = dst_raw.iter().map(|&p| dist.undistort(p)).collect();
         let matches = src.len();
         // Fewer matches than the inlier gate accepts can never pass it —
         // skip the estimation work (this threshold deliberately equals
@@ -1518,13 +1576,24 @@ fn process(
                 // would inflate the Error Bound with errors that never
                 // entered the model.
                 let (mut acc, mut cnt) = (0.0f64, 0usize);
-                for r in &e.residuals {
+                let mut idxs: Vec<usize> = Vec::new();
+                for (k, r) in e.residuals.iter().enumerate() {
                     if *r <= LINK_INLIER_THRESHOLD_PX {
                         acc += r * r;
                         cnt += 1;
+                        idxs.push(k);
                     }
                 }
-                link_quality.push(LinkQuality {
+                let step = idxs.len().div_ceil(calib::CALIB_MATCHES_PER_LINK).max(1);
+                let (mut in_s, mut in_d) = (Vec::new(), Vec::new());
+                for (j, &k) in idxs.iter().enumerate() {
+                    if j % step == 0 {
+                        in_s.push(src_raw[k]);
+                        in_d.push(dst_raw[k]);
+                    }
+                }
+                inliers_raw.push((in_s, in_d));
+                quality.push(LinkQuality {
                     matches,
                     inliers: e.inliers,
                     rms_px: (acc / cnt.max(1) as f64).sqrt(),
@@ -1541,10 +1610,19 @@ fn process(
             }
         }
     }
+    Ok(LinkEstimates { links, quality, inliers_raw })
+}
 
-    // 4. Chain: W[i] maps wall mm -> keyframe i px.
+/// Chain the links outward from the anchor: W[i] maps wall mm -> keyframe i
+/// (ideal) px.
+fn build_chain(
+    links: &[Homography],
+    anchor_h: &Homography,
+    ka: usize,
+) -> Result<Vec<[f64; 9]>, PanError> {
+    let n = links.len() + 1;
     let mut w_chain: Vec<[f64; 9]> = vec![[0.0; 9]; n];
-    w_chain[ka] = est_a.h.0;
+    w_chain[ka] = anchor_h.0;
     for i in ka + 1..n {
         w_chain[i] = mat3_mul(&links[i - 1].0, &w_chain[i - 1]);
     }
@@ -1552,6 +1630,188 @@ fn process(
         let inv = mat3_inv(&links[i].0).ok_or(PanError::DegenerateExtent)?;
         w_chain[i] = mat3_mul(&inv, &w_chain[i + 1]);
     }
+    Ok(w_chain)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process(
+    keyframes: &[Keyframe],
+    width: usize,
+    height: usize,
+    correction_factor: f64,
+    close_loop: bool,
+    truncated: bool,
+    calibrate: bool,
+) -> Result<PanOutput, PanError> {
+    let n = keyframes.len();
+    let side_mm = MARKER_SIDE_MM * correction_factor;
+
+    // 1. Marker detection per keyframe (RAW measured corners).
+    let detections: Vec<Vec<DetectedMarker>> = keyframes
+        .iter()
+        .map(|kf| detect_markers(&kf.gray, width, height))
+        .collect();
+    let find_raw = |i: usize, id: u16| detections[i].iter().find(|m| m.id == id);
+
+    // 2. Anchor at the best Marker A detection.
+    let ka = (0..n)
+        .filter_map(|i| find_raw(i, LEFT_MARKER_ID).map(|m| (i, quad_area(&m.corners))))
+        .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .ok_or(PanError::AnchorMarkerNotFound)?;
+    let world = anchor_corners_mm(side_mm);
+
+    // 3. Per-link tracking (collected once) + pinhole estimation pass:
+    //    anchor homography, links[i]: px_i -> px_{i+1}, and the chain.
+    let raw_matches = collect_link_matches(keyframes, &detections, width, height);
+    let est_a_raw = estimate(
+        &world,
+        &find_raw(ka, LEFT_MARKER_ID).unwrap().corners,
+        LINK_INLIER_THRESHOLD_PX,
+    )
+    .ok_or(PanError::AnchorEstimateFailed)?;
+    let le = estimate_links(&raw_matches, &Distortion::none(width, height), width, height)?;
+    let chain0 = build_chain(&le.links, &est_a_raw.h, ka)?;
+
+    // 3b. Self-calibration (issue #6, see crate::calib and the module docs):
+    //     jointly refine {focal, k1, keyframe poses} over the marker corners
+    //     and tracked inliers, then — only when the conditioning gates pass —
+    //     undistort every measured point and re-run anchor + links + chain
+    //     on the corrected points. Any failure on the calibrated re-run
+    //     falls back to the pinhole pass rather than half-applying a lens.
+    let mut dist = Distortion::none(width, height);
+    let mut calibration: Option<SelfCalibration> = None;
+    let mut dets_u: Option<Vec<Vec<DetectedMarker>>> = None;
+    let (mut est_a, mut link_quality, mut w_chain) = (est_a_raw, le.quality, chain0);
+    if calibrate && n >= calib::MIN_CALIB_KEYFRAMES {
+        let marker_a_obs: Vec<(usize, [[f64; 2]; 4])> = (0..n)
+            .filter_map(|i| find_raw(i, LEFT_MARKER_ID).map(|m| (i, m.corners)))
+            .collect();
+        // Bootstrap k1 by a coarse deterministic scan minimizing the links'
+        // inlier RMS: a homography fits UNDISTORTED matches much better
+        // than distorted ones, and the signal is independent of the focal.
+        // This matters because the raw pinhole chain of a genuinely
+        // distorted lens absorbs the distortion field into per-link
+        // perspective terms — chained up, those compound into a badly
+        // deformed chain that would poison the bundle's pose
+        // initialization.
+        let link_rms = |le: &LinkEstimates| -> f64 {
+            le.quality.iter().map(|q| q.rms_px).sum::<f64>() / le.quality.len().max(1) as f64
+        };
+        let mut samples: Vec<(f64, f64, LinkEstimates)> = Vec::new();
+        let mut k1v = -0.30;
+        while k1v <= 0.061 {
+            let d = Distortion::new(width, height, k1v);
+            if let Ok(le) = estimate_links(&raw_matches, &d, width, height) {
+                let obj = link_rms(&le);
+                samples.push((k1v, obj, le));
+            }
+            k1v += 0.02;
+        }
+        let best_i = samples
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1 .1.partial_cmp(&b.1 .1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i);
+        let boot = best_i.and_then(|bi| {
+            let mut k1_boot = samples[bi].0;
+            let obj_mid = samples[bi].1;
+            // Parabolic refine when both equally spaced neighbours exist.
+            if bi > 0 && bi + 1 < samples.len() {
+                let (kl, ol, _) = &samples[bi - 1];
+                let (kr, or_, _) = &samples[bi + 1];
+                if (kl - (k1_boot - 0.02)).abs() < 1e-9 && (kr - (k1_boot + 0.02)).abs() < 1e-9 {
+                    let denom = ol - 2.0 * obj_mid + or_;
+                    if denom > 1e-12 {
+                        k1_boot += (0.02 * 0.5 * (ol - or_) / denom).clamp(-0.02, 0.02);
+                    }
+                }
+            }
+            let d_boot = Distortion::new(width, height, k1_boot);
+            let a_corners = find_raw(ka, LEFT_MARKER_ID).unwrap().corners;
+            let a_u = [
+                d_boot.undistort(a_corners[0]),
+                d_boot.undistort(a_corners[1]),
+                d_boot.undistort(a_corners[2]),
+                d_boot.undistort(a_corners[3]),
+            ];
+            let ea = estimate(&world, &a_u, LINK_INLIER_THRESHOLD_PX)?;
+            let le_boot = estimate_links(&raw_matches, &d_boot, width, height).ok()?;
+            let chain = build_chain(&le_boot.links, &ea.h, ka).ok()?;
+            Some((k1_boot, chain, le_boot.inliers_raw))
+        });
+        let (k1_init, boot_chain, boot_inliers) = match &boot {
+            Some((k1b, ch, inl)) => (*k1b, ch, inl),
+            None => (0.0, &w_chain, &le.inliers_raw),
+        };
+        let undistort_all = |d2: &Distortion| -> Vec<Vec<DetectedMarker>> {
+            detections
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .map(|m| DetectedMarker {
+                            id: m.id,
+                            corners: [
+                                d2.undistort(m.corners[0]),
+                                d2.undistort(m.corners[1]),
+                                d2.undistort(m.corners[2]),
+                                d2.undistort(m.corners[3]),
+                            ],
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // Both non-refused outcomes apply identically — k1 plus the
+        // bundle's chain (jointly optimal over every observation at once;
+        // pairwise re-chaining was measured to compound a systematic
+        // ~1%/link bias into a guard-tripping ~10% scale error at B on
+        // low-wobble pans). They differ only in whether a focal is CLAIMED:
+        // on DistortionOnly the cost was flat along focal, so the chain is
+        // insensitive to it (see calib::CalibOutcome) and `calibration`
+        // stays None — the applied k1 is reported via PanOutput::applied_k1
+        // and Marker B's closure remains the independent check either way.
+        let (k1_apply, bundle_chain, sc) = match calib::self_calibrate(&calib::CalibInput {
+            width,
+            height,
+            side_mm,
+            k1_init,
+            w_chain: boot_chain,
+            marker_a: &marker_a_obs,
+            links: boot_inliers,
+        }) {
+            calib::CalibOutcome::Full(sc, chain) => (sc.k1, Some(chain), Some(sc)),
+            calib::CalibOutcome::DistortionOnly { k1, chain } => (k1, Some(chain), None),
+            calib::CalibOutcome::Refused => (0.0, None, None),
+        };
+        if let Some(bundle_chain) = bundle_chain {
+            let d2 = Distortion::new(width, height, k1_apply);
+            let du = undistort_all(&d2);
+            // The per-link estimates are still re-run on undistorted points
+            // for the Error Bound's link-quality terms, and the anchor is
+            // re-fit for its corner residual.
+            let redo = estimate(
+                &world,
+                &du[ka].iter().find(|m| m.id == LEFT_MARKER_ID).unwrap().corners,
+                LINK_INLIER_THRESHOLD_PX,
+            )
+            .and_then(|ea| {
+                let l = estimate_links(&raw_matches, &d2, width, height).ok()?;
+                Some((ea, l.quality))
+            });
+            if let Some((ea, lq)) = redo {
+                est_a = ea;
+                link_quality = lq;
+                w_chain = bundle_chain;
+                dist = d2;
+                dets_u = Some(du);
+                calibration = sc;
+            }
+        }
+    }
+    let dets = dets_u.as_ref().unwrap_or(&detections);
+    let find = |i: usize, id: u16| dets[i].iter().find(|m| m.id == id);
+    let marker_a = find(ka, LEFT_MARKER_ID).unwrap();
 
     // Wall-frame chain positions (frame centers) for closure weights and the
     // tracking random walk.
@@ -1749,8 +2009,14 @@ fn process(
                 // by systematic projective distortion of the chain at B and
                 // already feeds the bound via the closure ramp.)
                 let mmpp_b = local_mm_per_px(&Homography(w_chain[kb]), s_fit[0]).unwrap_or(1.0);
-                let blur_px =
-                    marker_edge_blur_px(&keyframes[kb].gray, width, height, &marker_b.corners);
+                // Blur is profiled on the RAW image, so it needs the RAW
+                // (distorted) corner positions, not the undistorted ones.
+                let blur_px = marker_edge_blur_px(
+                    &keyframes[kb].gray,
+                    width,
+                    height,
+                    &find_raw(kb, RIGHT_MARKER_ID).unwrap().corners,
+                );
                 let blur_penalty = (blur_px / 2.0).max(1.0);
                 let sigma_b_mm = CORNER_SIGMA_FLOOR_PX * mmpp_b * blur_penalty;
                 let mut sigma_scale = sigma_b_mm / (side_mm * std::f64::consts::SQRT_2);
@@ -1842,12 +2108,16 @@ fn process(
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
     let mut max_y = f64::NEG_INFINITY;
+    // The chain lives in IDEAL (undistorted) px; the actual frame's corner
+    // positions in that space are the undistorted image corners (identity
+    // when uncalibrated).
     let frame_corners = [
         [0.0, 0.0],
         [width as f64, 0.0],
         [width as f64, height as f64],
         [0.0, height as f64],
-    ];
+    ]
+    .map(|fc| dist.undistort(fc));
     let mut inv_chain: Vec<[f64; 9]> = Vec::with_capacity(n);
     for w_i in &w_chain {
         let inv = mat3_inv(w_i).ok_or(PanError::DegenerateExtent)?;
@@ -1920,7 +2190,11 @@ fn process(
                 if d2 >= best_d2[o] {
                     continue; // an already-rendered keyframe is closer
                 }
-                if let Some((sx, sy)) = w_i.apply(wx, wy) {
+                // The chain maps wall -> IDEAL px; the real pixels live in
+                // the distorted image, so the sample position is bent back
+                // through the calibrated lens (identity when uncalibrated).
+                if let Some((ix, iy)) = w_i.apply(wx, wy) {
+                    let [sx, sy] = dist.distort([ix, iy]);
                     if sx >= 0.0
                         && sy >= 0.0
                         && sx <= (width - 1) as f64
@@ -1995,6 +2269,8 @@ fn process(
         links: link_quality,
         closure,
         closure_rejected,
+        calibration,
+        applied_k1: dist.k1,
         bound,
         far_x_mm,
     })

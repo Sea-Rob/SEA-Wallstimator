@@ -16,6 +16,7 @@
 
 use wasm_bindgen::prelude::*;
 
+pub mod calib;
 pub mod detect;
 pub mod homography;
 pub mod linalg;
@@ -479,6 +480,46 @@ impl PanWallImage {
     /// Scale correction the redistribution applied at the far end.
     pub fn closure_scale_correction(&self) -> f64 {
         self.out.closure.as_ref().map_or(1.0, |c| c.scale_correction)
+    }
+
+    /// True when self-calibrated intrinsics (issue #6: shared focal + k1
+    /// radial distortion, refined jointly with the keyframe homographies)
+    /// passed the conditioning gates and were applied to this result. False
+    /// = honest pinhole fallback (short / barely-rotating / fronto-parallel
+    /// chains cannot support self-calibration; see `calib` module docs) —
+    /// the page must say "uncalibrated", never invent a focal.
+    pub fn calibrated(&self) -> bool {
+        self.out.calibration.is_some()
+    }
+
+    /// Self-calibrated focal length (px at processing resolution); 0.0 when
+    /// uncalibrated — gate on [`PanWallImage::calibrated`] first.
+    pub fn calibrated_focal_px(&self) -> f64 {
+        self.out.calibration.as_ref().map_or(0.0, |c| c.focal_px)
+    }
+
+    /// Self-calibrated division-model k1 (dimensionless, radius normalized
+    /// by the half frame diagonal; barrel < 0); 0.0 when uncalibrated.
+    pub fn calibrated_k1(&self) -> f64 {
+        self.out.calibration.as_ref().map_or(0.0, |c| c.k1)
+    }
+
+    /// True when lens distortion was corrected in this result's geometry —
+    /// either the fully calibrated path, or the distortion-only path where
+    /// k1 passed its conditioning gate but the focal did not (low-wobble
+    /// pans pin k1 from radial bending long before they pin the focal; the
+    /// provable k1 is applied, no focal is claimed). When this is true and
+    /// [`PanWallImage::calibrated`] is false the page should say
+    /// "distortion corrected, focal unclaimed", not "uncalibrated".
+    pub fn distortion_corrected(&self) -> bool {
+        self.out.applied_k1 != 0.0
+    }
+
+    /// Division-model k1 actually applied to this result's geometry
+    /// (0.0 = pure pinhole; set on both the calibrated and distortion-only
+    /// paths).
+    pub fn applied_k1(&self) -> f64 {
+        self.out.applied_k1
     }
 
     /// Per-position Error Bound component (mm) at wall x mm from Marker A's

@@ -7,6 +7,17 @@
 //! `marker::MARKER_SIDE_MM * correction_factor` (MULTIPLY — see lib.rs and
 //! ADR-0002), which is what puts real millimetres behind the output's
 //! mm-per-px scale.
+//!
+//! # Lens model: pinhole, k1 = 0 — deliberately
+//!
+//! A single still cannot self-calibrate: a homography absorbs any focal
+//! length, and one view gives no way to separate lens distortion from the
+//! 8-DoF fit (see [`crate::calib`] for why a pan's keyframe set CAN). This
+//! path therefore assumes an ideal pinhole; radial distortion of the real
+//! lens lands in the corner residuals and in frame-edge geometry. When a
+//! recorded pan in the same session has produced calibrated intrinsics,
+//! those could be reused to undistort stills too — a later slice; the
+//! cross-capture plumbing is intentionally not built yet.
 
 use crate::detect::{detect_markers, DetectedMarker};
 use crate::homography::{estimate, Estimate, Homography};
