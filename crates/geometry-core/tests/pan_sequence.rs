@@ -207,18 +207,32 @@ fn loop_closure_reduces_far_end_error() {
     // Noisier capture: per-link tracking errors accumulate into real scale
     // drift over the chain, which is exactly what closure corrects. Fixed
     // seed keeps CI deterministic.
+    //
+    // Both runs force the pinhole path (`calibrate = false`): this test is
+    // about the closure MECHANISM, which needs a chain with accumulated
+    // pairwise drift to correct. Since issue #6 the production path first
+    // runs the self-calibration bundle, whose jointly refined chain leaves
+    // so little drift at B (sub-millimetre on this fixture) that the
+    // closure correction is noise-level either way — that path's distance
+    // contract is covered by tests/self_calibration.rs. The pinhole path
+    // stays production-reachable: it is the documented fallback whenever
+    // the conditioning gates refuse a calibration.
     let scene = scene();
     let a = [250.0f64, 250.0];
     let b = [3700.0f64, 150.0];
     let true_mm = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
 
     let mut open_core = record_pan(&scene, 60, 6.0, 7777);
-    let open = open_core.finish(1.0, false).expect("open-loop pan must process");
+    let open = open_core
+        .finish_with(1.0, false, false)
+        .expect("open-loop pan must process");
     assert!(open.closure.is_none(), "close_loop=false must skip closure");
     let open_err = (measure_mm(&open, a, b, 60.0) - true_mm).abs();
 
     let mut closed_core = record_pan(&scene, 60, 6.0, 7777);
-    let closed = closed_core.finish(1.0, true).expect("closed-loop pan must process");
+    let closed = closed_core
+        .finish_with(1.0, true, false)
+        .expect("closed-loop pan must process");
     let closure = closed.closure.as_ref().expect("closure must engage");
     let closed_err = (measure_mm(&closed, a, b, 60.0) - true_mm).abs();
 

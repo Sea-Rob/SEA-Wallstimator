@@ -96,6 +96,9 @@ export function recordPanResult({
   closureDiscrepancyMm,
   closureResidualMm,
   scaleCorrection,
+  calibrated,
+  calibratedFocalPx,
+  calibratedK1,
   errorBoundNearMm,
   errorBoundFarMm,
   errorBoundWorstMm,
@@ -121,6 +124,12 @@ export function recordPanResult({
     closureDiscrepancyMm,
     closureResidualMm,
     scaleCorrection,
+    // Self-calibration outcome (issue #6). `calibrated: false` is an honest
+    // pinhole fallback (chain couldn't support calibration), and the focal /
+    // k1 fields are null then — never a made-up focal.
+    calibrated: Boolean(calibrated),
+    calibratedFocalPx: calibrated ? calibratedFocalPx : null,
+    calibratedK1: calibrated ? calibratedK1 : null,
     // Per-position components (see pan.rs: not standalone 95% bounds).
     errorBoundNearMm,
     errorBoundFarMm,
