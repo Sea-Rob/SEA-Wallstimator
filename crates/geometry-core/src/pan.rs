@@ -20,6 +20,13 @@
 //! later commit beyond the gap, processing refuses with
 //! [`PanError::TrackingLost`] instead of silently chaining across it.
 //!
+//! Alongside selection, cheap live-coaching checks (issue #5) update a
+//! [`CoachStatus`] per frame — marker visibility (full-resolution detection
+//! every [`COACH_DETECT_EVERY`]th frame), motion speed and exposure — so the
+//! capture page can coach the Homeowner in real time and demand a retake
+//! when a recording ends without both markers ever seen, or when the core
+//! already knows the chain broke ([`PanCore::tracking_broken`]).
+//!
 //! **After capture** ([`PanCore::finish`]):
 //! 1. Reference Markers are detected in every keyframe.
 //! 2. The wall frame is anchored at the best (largest) Marker A detection,
@@ -154,6 +161,346 @@ pub const MAX_CLOSURE_DISCREPANCY_MM: f64 = 50.0;
 /// scale rewrite is implausible for the same reasons as above.
 pub const MAX_CLOSURE_SCALE_DEV: f64 = 0.03;
 
+// ---------------------------------------------------------------------------
+// Live capture coaching (issue #5): cheap per-frame checks that run alongside
+// keyframe selection so the UI can coach the Homeowner WHILE recording. The
+// speed and exposure checks reuse what push_frame already computes (thumbnail
+// shift -> motion speed, thumbnail luma -> exposure); marker visibility is
+// the one check that pays for its own work — FULL-RESOLUTION detection every
+// [`COACH_DETECT_EVERY`] frames — because its verdict feeds the retake gate
+// and must therefore match what [`PanCore::finish`]'s own detection pass can
+// see (a downscaled plane raises the detection floor and made the coach
+// demand retakes of perfectly processable captures). Coaching is purely
+// observational: it never influences keyframe selection or processing.
+//
+// A rotation-dominant-motion cue (issue #19's stand-and-swivel habit) was
+// removed here: its flow-curvature heuristic could not separate camera
+// rotation from translation along a wall viewed at an angle — the t_z·sin(yaw)
+// component of angled-plane flow is non-affine with the same edges-faster-
+// than-centre quadratic signature — so it false-fired persistently on correct
+// technique. The post-capture closure plausibility guard
+// ([`MAX_CLOSURE_DISCREPANCY_MM`] / [`MAX_CLOSURE_SCALE_DEV`]) remains the
+// backstop; issue #19 owns any live replacement.
+
+/// Run FULL-RESOLUTION marker detection every Nth pushed frame. Full-res
+/// because the coach's detection floor must equal the one in
+/// [`PanCore::finish`]: on a real phone FOV a 2×2-downscaled plane lost a
+/// plainly visible marker beyond ~2.3–2.5 m and the retake gate then refused
+/// captures processing could handle. Per-frame full-res detection is not
+/// frame-budget cheap, so the cadence is slow — the seen-flags are sticky,
+/// and frame 0 is always probed, so the start of a recording is covered
+/// immediately; at 30 fps this bounds "marker (re)acquired" latency to
+/// ~330 ms.
+const COACH_DETECT_EVERY: u64 = 10;
+
+/// Frames since the last marker sighting before "marker lost" trips. Mid-pan
+/// on a long wall legitimately sees neither marker for a while — a slow,
+/// correct pan of a 3-4 m wall spends 5-7 s between losing A and finding B —
+/// so this is generous (~8 s at 30 fps), not a reaction-time constant.
+pub const COACH_MARKER_STALE_FRAMES: u64 = 240;
+
+/// Motion-speed hysteresis (fractions of frame width per frame) on an EMA of
+/// the tracked thumbnail shift. 0.028 * 640 px ~= 18 px/frame: at a typical
+/// 1/60 s exposure that smears ~9 px of motion blur across the frame — past
+/// what keyframe tracking tolerates. A full-width pan at the HI threshold
+/// takes ~1.2 s; the coached pace is several times slower.
+const COACH_SPEED_HI_FRAC: f64 = 0.028;
+const COACH_SPEED_LO_FRAC: f64 = 0.018;
+
+/// EMA smoothing for the speed check: reacts in ~3 frames (~100 ms).
+const COACH_SPEED_ALPHA: f64 = 0.4;
+
+/// Exposure thresholds on the thumbnail luma histogram: "too dark" when most
+/// of the frame sits near black, "blown out" when most sits at saturation.
+const COACH_DARK_LUMA: f32 = 40.0;
+const COACH_BRIGHT_LUMA: f32 = 240.0;
+const COACH_DARK_FRAC: f64 = 0.70;
+const COACH_BRIGHT_FRAC: f64 = 0.50;
+
+/// Consecutive frames an exposure condition must hold to trip / to clear
+/// (~130 ms at 30 fps): a single auto-exposure hiccup must not flash a cue.
+const COACH_EXPOSURE_DEBOUNCE: u32 = 4;
+
+/// Real-motion floor (thumb px per frame) for the blur bookkeeping: tracked
+/// frames moving less than this are the Homeowner standing still — hand
+/// jitter, not pan motion — and belong on NEITHER side of the "share of
+/// motion frames blurred" ratio ([`CoachStatus::blur_fraction`]). Counting
+/// them in the denominator diluted the statistic: a fast pan followed by a
+/// long standstill read as mostly fine. 0.2 thumb px ≈ 1.6 full-res px per
+/// frame — well under any deliberate pan speed.
+const COACH_BLUR_MIN_MOTION_THUMB_PX: f64 = 0.2;
+
+/// Coaching flags (bitmask in [`CoachStatus::flags`]). A flag is set while
+/// its (debounced) check is tripping.
+pub const COACH_NO_MARKER: u8 = 1 << 0;
+pub const COACH_MARKER_LOST: u8 = 1 << 1;
+pub const COACH_TOO_FAST: u8 = 1 << 2;
+pub const COACH_TOO_DARK: u8 = 1 << 3;
+pub const COACH_BLOWN_OUT: u8 = 1 << 4;
+
+/// The single highest-priority coaching cue for the UI's one-message line.
+/// Priority: marker problems > too fast > exposure — a lost marker
+/// invalidates the session outright, speed ruins the frames the markers
+/// would be found in, and exposure ruins everything equally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoachCue {
+    AllGood = 0,
+    /// No Reference Marker has been seen yet: start with Marker A in view.
+    FindMarkerA = 1,
+    /// A marker was seen earlier but none for [`COACH_MARKER_STALE_FRAMES`].
+    MarkerLost = 2,
+    TooFast = 3,
+    TooDark = 4,
+    BlownOut = 5,
+}
+
+/// Compact per-frame coaching status. Read it after each
+/// [`PanCore::push_frame`]; all fields are cheap copies of already-computed
+/// state.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoachStatus {
+    /// Bitmask of the `COACH_*` flags currently tripping (debounced).
+    pub flags: u8,
+    /// Marker A / B sighted at least once this recording (sticky). Both must
+    /// be true by the time recording stops, or the capture needs a retake.
+    pub marker_a_seen: bool,
+    pub marker_b_seen: bool,
+    /// Smoothed tracked motion (full-resolution px per frame).
+    pub speed_px_per_frame: f64,
+    /// Mean thumbnail luma of the last frame (0-255).
+    pub mean_luma: f64,
+    /// Fraction of MOTION frames that were untrackable or over the speed
+    /// limit — the "mostly blurred" retake signal (a proxy: untrackable
+    /// frames also include featureless wall, which reads as the same
+    /// Homeowner problem). Tracked frames below the real-motion floor
+    /// ([`COACH_BLUR_MIN_MOTION_THUMB_PX`]: standing still) count on
+    /// neither side of the ratio.
+    pub blur_fraction: f64,
+}
+
+impl CoachStatus {
+    /// Highest-priority active cue (see [`CoachCue`] for the ordering).
+    pub fn cue(&self) -> CoachCue {
+        if self.flags & COACH_NO_MARKER != 0 {
+            CoachCue::FindMarkerA
+        } else if self.flags & COACH_MARKER_LOST != 0 {
+            CoachCue::MarkerLost
+        } else if self.flags & COACH_TOO_FAST != 0 {
+            CoachCue::TooFast
+        } else if self.flags & COACH_TOO_DARK != 0 {
+            CoachCue::TooDark
+        } else if self.flags & COACH_BLOWN_OUT != 0 {
+            CoachCue::BlownOut
+        } else {
+            CoachCue::AllGood
+        }
+    }
+}
+
+/// What the thumbnail tracker saw for one frame, for coaching purposes.
+enum CoachMotion {
+    /// The very first frame: nothing to move relative to.
+    FirstFrame,
+    /// Frame-to-frame thumbnail shift (thumb px).
+    Tracked([f64; 2]),
+    /// The tracker lost this frame (motion blur / featureless wall).
+    Untracked,
+    /// A byte-identical repeat of the previous frame (the camera pipeline
+    /// delivered no new frame before the processing loop came round again).
+    /// Its zero shift says nothing about the pan's real speed — observing
+    /// it would yank the speed EMA down and make the TOO_FAST cue flicker
+    /// at exactly the rates where processing outpaces the camera.
+    Duplicate,
+}
+
+/// Internal live-coaching state, updated once per pushed frame.
+struct CoachState {
+    /// Frames observed so far (== push_frame calls).
+    frame_idx: u64,
+    seen_a: bool,
+    seen_b: bool,
+    last_marker_frame: Option<u64>,
+    speed_ema_px: f64,
+    too_fast: bool,
+    dark_streak: u32,
+    dark_clear_streak: u32,
+    too_dark: bool,
+    bright_streak: u32,
+    bright_clear_streak: u32,
+    blown_out: bool,
+    mean_luma: f64,
+    /// Motion frames that were untrackable or over the speed limit.
+    fast_frames: u64,
+    /// Frames with a REAL motion observation: tracked above the real-motion
+    /// floor, or untrackable (blur / featureless — unmeasurable, but not a
+    /// standstill: a still camera on a wall tracks near-zero shift fine).
+    motion_frames: u64,
+}
+
+impl CoachState {
+    fn new() -> CoachState {
+        CoachState {
+            frame_idx: 0,
+            seen_a: false,
+            seen_b: false,
+            last_marker_frame: None,
+            speed_ema_px: 0.0,
+            too_fast: false,
+            dark_streak: 0,
+            dark_clear_streak: 0,
+            too_dark: false,
+            bright_streak: 0,
+            bright_clear_streak: 0,
+            blown_out: false,
+            mean_luma: 0.0,
+            fast_frames: 0,
+            motion_frames: 0,
+        }
+    }
+
+    /// One coaching observation per pushed frame: exposure from the
+    /// (already computed) thumbnail, motion speed from the (already
+    /// computed) tracked thumbnail shift, and full-resolution marker
+    /// detection every [`COACH_DETECT_EVERY`]th frame.
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &mut self,
+        gray: &[u8],
+        thumb: &[f32],
+        width: usize,
+        height: usize,
+        thumb_w: usize,
+        thumb_h: usize,
+        motion: CoachMotion,
+    ) {
+        let idx = self.frame_idx;
+        self.frame_idx += 1;
+
+        // Exposure: luma histogram of the (already computed) thumbnail.
+        let n = (thumb_w * thumb_h).max(1) as f64;
+        let (mut sum, mut dark, mut bright) = (0.0f64, 0u32, 0u32);
+        for &v in thumb {
+            sum += v as f64;
+            if v < COACH_DARK_LUMA {
+                dark += 1;
+            } else if v > COACH_BRIGHT_LUMA {
+                bright += 1;
+            }
+        }
+        self.mean_luma = sum / n;
+        let streak = |cond: bool, on: &mut u32, off: &mut u32, state: &mut bool| {
+            if cond {
+                *on += 1;
+                *off = 0;
+                if *on >= COACH_EXPOSURE_DEBOUNCE {
+                    *state = true;
+                }
+            } else {
+                *off += 1;
+                *on = 0;
+                if *off >= COACH_EXPOSURE_DEBOUNCE {
+                    *state = false;
+                }
+            }
+        };
+        streak(
+            dark as f64 / n > COACH_DARK_FRAC,
+            &mut self.dark_streak,
+            &mut self.dark_clear_streak,
+            &mut self.too_dark,
+        );
+        streak(
+            bright as f64 / n > COACH_BRIGHT_FRAC,
+            &mut self.bright_streak,
+            &mut self.bright_clear_streak,
+            &mut self.blown_out,
+        );
+
+        // Marker visibility: FULL-RESOLUTION detection every Nth frame —
+        // full-res so the coach's detection floor equals finish()'s own at
+        // the same scale, and the retake gate never refuses a capture whose
+        // markers processing would find (see COACH_DETECT_EVERY). The
+        // detector needs >= 32 px planes and a marker >= 14 px.
+        if idx % COACH_DETECT_EVERY == 0 && width >= 32 && height >= 32 {
+            for m in detect_markers(gray, width, height) {
+                match m.id {
+                    LEFT_MARKER_ID => self.seen_a = true,
+                    RIGHT_MARKER_ID => self.seen_b = true,
+                    _ => {}
+                }
+                self.last_marker_frame = Some(idx);
+            }
+        }
+
+        // Motion speed + blur bookkeeping (every frame after the first).
+        let hi = COACH_SPEED_HI_FRAC * width as f64;
+        let lo = COACH_SPEED_LO_FRAC * width as f64;
+        match motion {
+            CoachMotion::FirstFrame | CoachMotion::Duplicate => {}
+            CoachMotion::Tracked(shift) => {
+                let thumb_px = shift[0].hypot(shift[1]);
+                let px = thumb_px * THUMB_DIV as f64;
+                self.speed_ema_px =
+                    COACH_SPEED_ALPHA * px + (1.0 - COACH_SPEED_ALPHA) * self.speed_ema_px;
+                if self.speed_ema_px > hi {
+                    self.too_fast = true;
+                } else if self.speed_ema_px < lo {
+                    self.too_fast = false;
+                }
+                // blur_fraction is the share of MOTION frames blurred: a
+                // standing-still frame (tracked jitter under the floor) is
+                // not a motion frame and must not dilute the denominator.
+                if thumb_px >= COACH_BLUR_MIN_MOTION_THUMB_PX {
+                    self.motion_frames += 1;
+                    if px > hi {
+                        self.fast_frames += 1;
+                    }
+                }
+            }
+            // Untrackable: motion blur or a featureless stretch — either way
+            // a frame the pipeline cannot use; count it for blur_fraction
+            // but leave the (unmeasurable) speed state alone.
+            CoachMotion::Untracked => {
+                self.motion_frames += 1;
+                self.fast_frames += 1;
+            }
+        }
+    }
+
+    fn status(&self) -> CoachStatus {
+        let mut flags = 0u8;
+        match self.last_marker_frame {
+            None => {
+                if self.frame_idx > 0 {
+                    flags |= COACH_NO_MARKER;
+                }
+            }
+            Some(f) => {
+                if self.frame_idx.saturating_sub(f) > COACH_MARKER_STALE_FRAMES {
+                    flags |= COACH_MARKER_LOST;
+                }
+            }
+        }
+        if self.too_fast {
+            flags |= COACH_TOO_FAST;
+        }
+        if self.too_dark {
+            flags |= COACH_TOO_DARK;
+        }
+        if self.blown_out {
+            flags |= COACH_BLOWN_OUT;
+        }
+        CoachStatus {
+            flags,
+            marker_a_seen: self.seen_a,
+            marker_b_seen: self.seen_b,
+            speed_px_per_frame: self.speed_ema_px,
+            mean_luma: self.mean_luma,
+            blur_fraction: self.fast_frames as f64 / self.motion_frames.max(1) as f64,
+        }
+    }
+}
+
 /// Furthest the stitched output extends from the anchor (mm).
 const MAX_PAN_EXTENT_MM: f64 = 8000.0;
 
@@ -215,6 +562,9 @@ pub struct PanCore {
     /// Keyframe index after which continuity broke (sticky, first gap).
     broken_after: Option<usize>,
     truncated: bool,
+    /// Live-coaching state (issue #5): observational only — never influences
+    /// keyframe selection or processing.
+    coach: CoachState,
 }
 
 impl PanCore {
@@ -232,6 +582,7 @@ impl PanCore {
             pending_gap: false,
             broken_after: None,
             truncated: false,
+            coach: CoachState::new(),
         }
     }
 
@@ -239,8 +590,29 @@ impl PanCore {
         self.keyframes.len()
     }
 
+    /// Live-coaching status as of the last pushed frame (issue #5).
+    pub fn coach_status(&self) -> CoachStatus {
+        self.coach.status()
+    }
+
     pub fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// True when the core ALREADY KNOWS post-capture processing must fail
+    /// with [`PanError::TrackingLost`]: continuity broke mid-recording and
+    /// keyframes were committed beyond the gap. The capture page's retake
+    /// gate consults this at stop time so the Homeowner is told immediately,
+    /// instead of waiting through a processing run for [`PanCore::finish`]
+    /// to fail with the same fact. (A trailing untrackable gap with nothing
+    /// committed beyond it does not break processing — finish() drops the
+    /// stale candidate and proceeds — so it is deliberately not reported
+    /// here.) This is CERTAIN knowledge only: a [`PanError::WeakSegment`]
+    /// — too few or too tightly clustered matches on one link — can still
+    /// surface only at processing time, because link quality is not known
+    /// until full-resolution matching runs.
+    pub fn tracking_broken(&self) -> bool {
+        self.broken_after.is_some()
     }
 
     /// Luma plane + thumbnail + sharpness only — the RGBA copy is deferred
@@ -265,6 +637,15 @@ impl PanCore {
             shift_from_prev,
         };
         if self.keyframes.is_empty() {
+            self.coach.observe(
+                &gray,
+                &thumb,
+                self.width,
+                self.height,
+                self.thumb_w,
+                self.thumb_h,
+                CoachMotion::FirstFrame,
+            );
             self.keyframes.push(retain(gray, sharpness, [0.0, 0.0]));
             self.prev_thumb = Some(thumb);
             self.acc_shift = [0.0, 0.0];
@@ -275,6 +656,23 @@ impl PanCore {
         let prev = self.prev_thumb.as_ref().unwrap();
         let shift = ncc_shift_local(prev, &thumb, self.thumb_w, self.thumb_h);
         let tracked = shift.filter(|&(_, _, s)| s >= MIN_SHIFT_SCORE);
+        self.coach.observe(
+            &gray,
+            &thumb,
+            self.width,
+            self.height,
+            self.thumb_w,
+            self.thumb_h,
+            match tracked {
+                // A perfect-correlation zero shift is a repeated camera
+                // frame, not a measurement of a stationary pan.
+                Some((dx, dy, s)) if dx == 0.0 && dy == 0.0 && s > 0.999 => {
+                    CoachMotion::Duplicate
+                }
+                Some((dx, dy, _)) => CoachMotion::Tracked([dx, dy]),
+                None => CoachMotion::Untracked,
+            },
+        );
         let Some((ddx, ddy, _score)) = tracked else {
             // Untrackable content (blank wall / motion blur): keeping it
             // would spend the cap on frames the tracker cannot use anyway.
