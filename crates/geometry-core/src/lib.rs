@@ -504,6 +504,24 @@ impl PanWallImage {
         self.out.calibration.as_ref().map_or(0.0, |c| c.k1)
     }
 
+    /// True when lens distortion was corrected in this result's geometry —
+    /// either the fully calibrated path, or the distortion-only path where
+    /// k1 passed its conditioning gate but the focal did not (low-wobble
+    /// pans pin k1 from radial bending long before they pin the focal; the
+    /// provable k1 is applied, no focal is claimed). When this is true and
+    /// [`PanWallImage::calibrated`] is false the page should say
+    /// "distortion corrected, focal unclaimed", not "uncalibrated".
+    pub fn distortion_corrected(&self) -> bool {
+        self.out.applied_k1 != 0.0
+    }
+
+    /// Division-model k1 actually applied to this result's geometry
+    /// (0.0 = pure pinhole; set on both the calibrated and distortion-only
+    /// paths).
+    pub fn applied_k1(&self) -> f64 {
+        self.out.applied_k1
+    }
+
     /// Per-position Error Bound component (mm) at wall x mm from Marker A's
     /// origin. NOT a standalone 95% position bound — see
     /// [`pan::BoundModel::bound_at_mm`]; use `error_bound_between_mm` for

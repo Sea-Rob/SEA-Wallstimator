@@ -417,3 +417,89 @@ fn fronto_parallel_translation_only_pan_refuses_calibration() {
         "a rotation-free fronto-parallel chain must not claim a focal"
     );
 }
+
+/// The adversarial-review finding on the refusal path: a LOW-wobble pan
+/// through a genuinely distorted lens cannot pin the focal (shallow LM
+/// valley, sigma way past the gate) — but k1 is observable from radial
+/// bending alone and passes its own gate by orders of magnitude. Throwing
+/// that k1 away was measured to leave a chain fighting real distortion the
+/// closure cannot absorb, with an Error Bound that did NOT cover the true
+/// error. The contract now: apply the provable k1 (distortion-only path),
+/// claim no focal, and the distance contract must hold.
+#[test]
+fn low_wobble_distorted_pan_corrects_distortion_without_claiming_a_focal() {
+    const K1_MILD: f64 = -0.05;
+    let scene = scene();
+    let cam = PanCamera {
+        focal_px: FOCAL_TRUE,
+        width: W,
+        height: H,
+        distance_mm: 1400.0,
+        start_center_mm: [500.0, 280.0],
+        end_center_mm: [3450.0, 280.0],
+        // Too little rotation to make the focal observable (the shared
+        // fixture needs 0.06 rad of yaw wobble to pin it to ~5%), yet the
+        // steady technique a careful Homeowner actually produces.
+        yaw_amp: 0.012,
+        pitch_amp: 0.004,
+    };
+    let dist = Distortion::new(W, H, K1_MILD);
+    let mut core = PanCore::new(W, H);
+    for (i, h) in cam.sequence(60).iter().enumerate() {
+        let rgba = render_scene_distorted(&scene, h, W, H, 2.5, 6000 + i as u64, &dist);
+        core.push_frame(&rgba);
+    }
+    let out = core.finish(1.0, true).expect("low-wobble pan must process");
+    println!(
+        "low-wobble distorted pan: {} keyframes, calibrated: {}, applied k1 {:.4} \
+         (true {K1_MILD}), closure applied: {}, rejected: {}",
+        out.keyframes_used,
+        out.calibration.is_some(),
+        out.applied_k1,
+        out.closure.is_some(),
+        out.closure_rejected,
+    );
+    assert!(
+        out.calibration.is_none(),
+        "a {:.3}-rad-wobble pan must not claim a focal (shallow valley)",
+        0.012
+    );
+    assert!(
+        (out.applied_k1 - K1_MILD).abs() <= K1_TOL,
+        "the provable k1 must be applied: got {:.4}, true {K1_MILD}",
+        out.applied_k1
+    );
+    assert!(
+        out.closure.is_some() && !out.closure_rejected,
+        "with distortion corrected the closure must engage plausibly \
+         (applied: {}, rejected: {})",
+        out.closure.is_some(),
+        out.closure_rejected
+    );
+
+    // The distance contract on the distortion-only path: the same checks the
+    // fully calibrated fixture passes, at both ends and across the full span.
+    let cases = [
+        ("near A", [250.0, 250.0], [250.0, 550.0], 300.0),
+        ("near B", [3700.0, 150.0], [3700.0, 450.0], 300.0),
+        (
+            "full span",
+            [250.0, 250.0],
+            [3700.0, 150.0],
+            ((3700.0f64 - 250.0).powi(2) + (150.0f64 - 250.0).powi(2)).sqrt(),
+        ),
+    ];
+    for (name, a, b, true_mm) in cases {
+        let measured = measure_mm(&out, a, b, 18.0);
+        let allowed = out.bound.bound_between_mm(a[0], b[0]);
+        let err = (measured - true_mm).abs();
+        println!(
+            "{name}: measured {measured:.1} mm (true {true_mm:.1}), err {err:.1} <= bound {allowed:.1}"
+        );
+        assert!(
+            err <= allowed,
+            "{name}: err {err:.1} mm exceeds the bound {allowed:.1} mm on the \
+             distortion-only path — the review finding is not fixed"
+        );
+    }
+}

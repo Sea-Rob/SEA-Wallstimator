@@ -141,6 +141,38 @@ test("calibration outcome is recorded frozen; uncalibrated pans get nulls, never
   assert.equal(uncal.calibratedK1, null);
 });
 
+test("distortion-only outcome: appliedK1 stored without a focal claim; pinhole pans get null", () => {
+  resetSession();
+  recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
+  lockForCapture();
+
+  // k1 passed its conditioning gate, the focal didn't: distortion corrected,
+  // calibrated stays false and the focal fields stay null.
+  const partial = recordPanResult({
+    ...PAN,
+    calibrated: false,
+    calibratedFocalPx: 0,
+    calibratedK1: 0,
+    distortionCorrected: true,
+    appliedK1: -0.051,
+  });
+  assert.equal(partial.calibrated, false);
+  assert.equal(partial.calibratedFocalPx, null);
+  assert.equal(partial.calibratedK1, null);
+  assert.equal(partial.distortionCorrected, true);
+  assert.equal(partial.appliedK1, -0.051);
+
+  // Fully pinhole pan: the applied-k1 sentinel 0.0 must become null.
+  const pinhole = recordPanResult({
+    ...PAN,
+    calibrated: false,
+    distortionCorrected: false,
+    appliedK1: 0,
+  });
+  assert.equal(pinhole.distortionCorrected, false);
+  assert.equal(pinhole.appliedK1, null);
+});
+
 test("pan record coexists with the still rectified record and resets with the session", () => {
   resetSession();
   recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });

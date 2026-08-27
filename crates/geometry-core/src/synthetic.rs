@@ -110,9 +110,8 @@ pub fn render_scene(
 /// same model the self-calibration estimates. Each output pixel lives in
 /// DISTORTED image coordinates; sampling undistorts the supersample position
 /// (closed form) before back-projecting to the wall, so projected points and
-/// rendered pixels are consistent: a wall point at
-/// `project_distorted(h_true, dist, x, y)` lands exactly on its rendered
-/// image.
+/// rendered pixels are consistent: a wall point projected through `h_true`
+/// then bent by `dist.distort` lands exactly on its rendered image.
 pub fn render_scene_distorted(
     scene: &Scene,
     h_true: &[f64; 9],
@@ -273,17 +272,6 @@ pub fn project(h: &[f64; 9], x: f64, y: f64) -> [f64; 2] {
         (h[0] * x + h[1] * y + h[2]) / w,
         (h[3] * x + h[4] * y + h[5]) / w,
     ]
-}
-
-/// Project a wall-plane point through a homography and the lens model:
-/// where the point lands in a [`render_scene_distorted`] frame.
-pub fn project_distorted(
-    h: &[f64; 9],
-    dist: &crate::calib::Distortion,
-    x: f64,
-    y: f64,
-) -> [f64; 2] {
-    dist.distort(project(h, x, y))
 }
 
 /// Wall-plane position of a marker's printed top-left corner given its

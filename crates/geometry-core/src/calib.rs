@@ -44,9 +44,18 @@
 //! within [`MAX_K1_SIGMA`], the chain must have at least
 //! [`MIN_CALIB_KEYFRAMES`] keyframes, the refined values must sit in a
 //! physically plausible range, and the refinement must not have worsened the
-//! reprojection RMS. Anything else falls back to the pinhole default —
-//! callers keep the wider uncalibrated Error Bound rather than a garbage
-//! focal.
+//! reprojection RMS.
+//!
+//! The two gates fail INDEPENDENTLY, and that asymmetry matters: k1 is
+//! observable from radial bending alone, so a low-wobble pan routinely pins
+//! k1 to ±0.0002 while leaving the focal in a shallow valley (σ ≫ 10%).
+//! Hence the three-way [`CalibOutcome`]: `Full` (both gates passed),
+//! `DistortionOnly` (k1 and the bundle's chain are applied, no focal is
+//! claimed — a flat cost along focal means the chain is insensitive to it;
+//! see the variant docs), `Refused` (nothing provable; the wider
+//! uncalibrated Error Bound stands). Discarding a provable k1 was measured
+//! to leave the fallback chain fighting real lens distortion the closure
+//! cannot absorb — with Error Bounds that did NOT cover the true error.
 
 use crate::linalg::{mat3_inv, solve_in_place};
 
@@ -115,10 +124,6 @@ impl Distortion {
     /// The pinhole identity for this frame size.
     pub fn none(width: usize, height: usize) -> Distortion {
         Distortion::new(width, height, 0.0)
-    }
-
-    pub fn is_identity(&self) -> bool {
-        self.k1 == 0.0
     }
 
     /// Measured (distorted) px -> ideal pinhole px. Closed form.
@@ -388,10 +393,37 @@ pub struct SelfCalibration {
     /// inverse scaled by the residual variance).
     pub focal_sigma_px: f64,
     pub k1_sigma: f64,
-    /// Weighted bundle reprojection RMS (px) at the pinhole starting point
-    /// and after joint refinement — the evidence the calibration helped.
+    /// Weighted bundle reprojection RMS (px) at the winning multi-start
+    /// initialization (which already includes the caller's bootstrap k1 —
+    /// NOT the pinhole pass) and after joint refinement; `after <= before`
+    /// is one of the acceptance gates.
     pub rms_before_px: f64,
     pub rms_after_px: f64,
+}
+
+/// What the conditioning gates allowed [`self_calibrate`] to claim (see the
+/// module docs on why the two gates fail independently).
+pub(crate) enum CalibOutcome {
+    /// Both gates passed: full calibration plus the wall->ideal-px chain
+    /// rebuilt from the bundle's jointly refined poses.
+    Full(SelfCalibration, Vec<[f64; 9]>),
+    /// k1 passed its gate but the focal did not (chain too fronto-parallel
+    /// to pin it): the distortion is real and well-determined, the focal
+    /// would be an artefact — no focal is ever reported. The bundle's chain
+    /// IS still returned and used: an unidentifiable focal means the cost
+    /// is flat along it, i.e. the fitted wall->ideal-px homographies are
+    /// insensitive to where in the valley the focal sits — the chain is
+    /// well-determined even when the focal is not (the wrongness lives in
+    /// the pose decomposition, which nothing downstream consumes). The
+    /// alternative — re-running the PAIRWISE chain on undistorted points —
+    /// was measured to compound a systematic ~1%/link bias into a ~10%
+    /// scale error at Marker B on low-wobble pans (constant overlap
+    /// geometry, so per-link bias never cancels), which the closure
+    /// plausibility guard rightly refuses. Marker B's loop closure stays
+    /// the independent downstream check on this chain either way.
+    DistortionOnly { k1: f64, chain: Vec<[f64; 9]> },
+    /// Nothing provable: stay pinhole with the wider uncalibrated bound.
+    Refused,
 }
 
 /// Parameter layout: [f, k1, (rvec, C) * n].
@@ -462,7 +494,7 @@ impl Bundle<'_> {
 }
 
 /// Forward-difference step for parameter `j` (layout: f, k1, 6-DoF poses).
-fn param_step(j: usize, p: &[f64], _n: usize) -> f64 {
+fn param_step(j: usize, p: &[f64]) -> f64 {
     if j == 0 {
         1e-6 * p[0].abs().max(1.0) // focal (px)
     } else if j == 1 {
@@ -484,7 +516,6 @@ fn run_lm(
     np: usize,
     m: usize,
 ) -> (Vec<f64>, f64, Vec<f64>) {
-    let n = bundle.n;
     let mut jac = vec![0.0f64; m * np];
     let mut jtj = vec![0.0f64; np * np];
     let mut jtr = vec![0.0f64; np];
@@ -494,7 +525,7 @@ fn run_lm(
 
     for _iter in 0..LM_ITERATIONS {
         for j in 0..np {
-            let step = param_step(j, &params, n);
+            let step = param_step(j, &params);
             let mut pj = params.clone();
             pj[j] += step;
             bundle.residuals(&pj, &mut r_pert);
@@ -563,17 +594,16 @@ fn run_lm(
 }
 
 /// Jointly refine {focal, k1, keyframe poses (=> homographies)} by LM over
-/// the pan's correspondences, then apply the conditioning gates. On success
-/// returns the calibration AND the refined wall->ideal-px chain rebuilt from
-/// the bundle's poses (`pose_h` per keyframe) — jointly optimal over ALL
-/// observations at once, unlike pairwise link composition, which compounds
-/// per-link perspective errors multiplicatively along the chain. `None`
-/// means "stay pinhole" — either the input cannot support calibration or
-/// the result did not prove itself.
-pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration, Vec<[f64; 9]>)> {
+/// the pan's correspondences, then apply the conditioning gates. On full
+/// success returns the calibration AND the refined wall->ideal-px chain
+/// rebuilt from the bundle's poses (`pose_h` per keyframe) — jointly optimal
+/// over ALL observations at once, unlike pairwise link composition, which
+/// compounds per-link perspective errors multiplicatively along the chain.
+/// See [`CalibOutcome`] for the partial (k1-only) and refused outcomes.
+pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> CalibOutcome {
     let n = input.w_chain.len();
     if n < MIN_CALIB_KEYFRAMES || input.marker_a.is_empty() || input.links.len() != n - 1 {
-        return None;
+        return CalibOutcome::Refused;
     }
     let cx = input.width as f64 / 2.0;
     let cy = input.height as f64 / 2.0;
@@ -623,7 +653,8 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
         bundle.residuals(&params0, &mut r);
         let m = r.len();
         if m < np + 20 {
-            return None; // not enough observations to also certify a result
+            // Not enough observations to also certify a result.
+            return CalibOutcome::Refused;
         }
         m_total = m;
         let cost0: f64 = r.iter().map(|v| v * v).sum();
@@ -633,12 +664,11 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
             best = Some((params, cost, r, rms_before));
         }
     }
-    let (params, cost, r, rms_before) = best?;
+    let Some((params, cost, r, rms_before)) = best else {
+        return CalibOutcome::Refused;
+    };
     let m = m_total;
 
-    // Per-parameter forward-difference step (shared by the LM and the final
-    // curvature evaluation below).
-    let step_of = |j: usize, p: &[f64]| -> f64 { param_step(j, p, n) };
     let mut jac = vec![0.0f64; m * np];
     let mut jtj = vec![0.0f64; np * np];
     let mut r_pert = Vec::with_capacity(m);
@@ -647,18 +677,15 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
     // recomputed at the accepted parameters for an honest curvature.
     let f = params[0];
     let k1 = params[1];
-    if !(f.is_finite() && k1.is_finite())
-        || !(MIN_FOCAL_FRAC * dim..=MAX_FOCAL_FRAC * dim).contains(&f)
-        || k1.abs() > MAX_ABS_K1
-    {
-        return None;
+    if !(f.is_finite() && k1.is_finite()) || k1.abs() > MAX_ABS_K1 {
+        return CalibOutcome::Refused;
     }
     let rms_after = (cost / m as f64).sqrt();
     if rms_after > rms_before {
-        return None; // refinement must not have made things worse
+        return CalibOutcome::Refused; // refinement must not have made things worse
     }
     for j in 0..np {
-        let step = step_of(j, &params);
+        let step = param_step(j, &params);
         let mut pj = params.clone();
         pj[j] += step;
         bundle.residuals(&pj, &mut r_pert);
@@ -695,13 +722,18 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
         let v = sigma2 * e[idx];
         (v.is_finite() && v > 0.0).then_some(v)
     };
-    let focal_sigma = var_of(0)?.sqrt();
-    let k1_sigma = var_of(1)?.sqrt();
-    if focal_sigma / f > MAX_FOCAL_REL_SIGMA || k1_sigma > MAX_K1_SIGMA {
-        return None; // ill-conditioned: a confident number would be a lie
+    let (Some(focal_var), Some(k1_var)) = (var_of(0), var_of(1)) else {
+        return CalibOutcome::Refused; // singular curvature: nothing certifiable
+    };
+    let focal_sigma = focal_var.sqrt();
+    let k1_sigma = k1_var.sqrt();
+    if k1_sigma > MAX_K1_SIGMA {
+        return CalibOutcome::Refused; // ill-conditioned: a confident number would be a lie
     }
-
-    // Rebuild the wall->ideal-px chain from the refined poses.
+    // Rebuild the wall->ideal-px chain from the refined poses. Valid on
+    // both outcomes below: when the focal gate fails, the cost was flat
+    // along focal, so these composite homographies are insensitive to the
+    // unclaimed focal (see [`CalibOutcome::DistortionOnly`]).
     let chain: Vec<[f64; 9]> = (0..n)
         .map(|i| {
             let rv = [params[2 + 6 * i], params[3 + 6 * i], params[4 + 6 * i]];
@@ -710,7 +742,16 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
         })
         .collect();
 
-    Some((
+    let focal_ok = (MIN_FOCAL_FRAC * dim..=MAX_FOCAL_FRAC * dim).contains(&f)
+        && focal_sigma / f <= MAX_FOCAL_REL_SIGMA;
+    if !focal_ok {
+        // The focal sits in a shallow valley (or drifted out of the
+        // physically plausible bracket) but k1 proved itself on radial
+        // bending alone — hand over k1 and the chain, claim no focal.
+        return CalibOutcome::DistortionOnly { k1, chain };
+    }
+
+    CalibOutcome::Full(
         SelfCalibration {
             focal_px: f,
             k1,
@@ -720,7 +761,7 @@ pub(crate) fn self_calibrate(input: &CalibInput<'_>) -> Option<(SelfCalibration,
             rms_after_px: rms_after,
         },
         chain,
-    ))
+    )
 }
 
 #[cfg(test)]

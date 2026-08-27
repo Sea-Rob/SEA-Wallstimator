@@ -47,11 +47,16 @@
 //!    links and chain are re-run on the corrected points — frame-edge
 //!    geometry stops bending, residuals drop, and with them the measured
 //!    terms of the Error Bound below (the bound tightens because its
-//!    inputs genuinely improved, not because a constant changed). When the
-//!    chain cannot support calibration (short, barely-rotating,
-//!    near-fronto-parallel — see the gates in [`crate::calib`]), the
-//!    pipeline honestly stays pinhole (k1 = 0) and keeps the wider
-//!    uncalibrated bound.
+//!    inputs genuinely improved, not because a constant changed). When only
+//!    the focal gate fails (low-wobble chains pin k1 from radial bending
+//!    long before they pin the focal), the provable k1 AND the bundle's
+//!    chain are still applied — no focal is claimed
+//!    ([`crate::calib::CalibOutcome::DistortionOnly`]: the flat cost along
+//!    focal that failed the gate is exactly what makes the chain
+//!    insensitive to it); discarding a provable k1 was measured to leave
+//!    bounds that do NOT cover on distorted lenses. Only when nothing is
+//!    provable does the pipeline stay fully pinhole (k1 = 0) with the
+//!    wider uncalibrated bound.
 //! 4. Loop closure: Marker B's corners in its best keyframe are
 //!    back-projected through the chain onto the wall plane. Because B's wall
 //!    *pose* is unknown but its printed *size* is known (ADR-0002), the
@@ -1315,6 +1320,13 @@ pub struct PanOutput {
     /// not prove itself; the honest response is the wider uncalibrated
     /// bound, never a garbage focal (see [`crate::calib`]).
     pub calibration: Option<SelfCalibration>,
+    /// Division-model k1 actually applied to this result's geometry
+    /// (0.0 = pure pinhole). Set with `calibration` on the fully calibrated
+    /// path, and WITHOUT it on the distortion-only path
+    /// ([`crate::calib::CalibOutcome::DistortionOnly`]: k1 passed its gate,
+    /// the focal did not — distortion is corrected but no focal is
+    /// claimed).
+    pub applied_k1: f64,
     pub bound: BoundModel,
     /// Wall x (mm) of the anchor-nearest and far output edges — where the
     /// near/far bound scalars are evaluated.
@@ -1732,7 +1744,34 @@ fn process(
             Some((k1b, ch, inl)) => (*k1b, ch, inl),
             None => (0.0, &w_chain, &le.inliers_raw),
         };
-        let sc = calib::self_calibrate(&calib::CalibInput {
+        let undistort_all = |d2: &Distortion| -> Vec<Vec<DetectedMarker>> {
+            detections
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .map(|m| DetectedMarker {
+                            id: m.id,
+                            corners: [
+                                d2.undistort(m.corners[0]),
+                                d2.undistort(m.corners[1]),
+                                d2.undistort(m.corners[2]),
+                                d2.undistort(m.corners[3]),
+                            ],
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // Both non-refused outcomes apply identically — k1 plus the
+        // bundle's chain (jointly optimal over every observation at once;
+        // pairwise re-chaining was measured to compound a systematic
+        // ~1%/link bias into a guard-tripping ~10% scale error at B on
+        // low-wobble pans). They differ only in whether a focal is CLAIMED:
+        // on DistortionOnly the cost was flat along focal, so the chain is
+        // insensitive to it (see calib::CalibOutcome) and `calibration`
+        // stays None — the applied k1 is reported via PanOutput::applied_k1
+        // and Marker B's closure remains the independent check either way.
+        let (k1_apply, bundle_chain, sc) = match calib::self_calibrate(&calib::CalibInput {
             width,
             height,
             side_mm,
@@ -1740,27 +1779,17 @@ fn process(
             w_chain: boot_chain,
             marker_a: &marker_a_obs,
             links: boot_inliers,
-        });
-        if let Some((sc, bundle_chain)) = sc {
-            let d2 = Distortion::new(width, height, sc.k1);
-            let undist_marker = |m: &DetectedMarker| DetectedMarker {
-                id: m.id,
-                corners: [
-                    d2.undistort(m.corners[0]),
-                    d2.undistort(m.corners[1]),
-                    d2.undistort(m.corners[2]),
-                    d2.undistort(m.corners[3]),
-                ],
-            };
-            let du: Vec<Vec<DetectedMarker>> = detections
-                .iter()
-                .map(|v| v.iter().map(undist_marker).collect())
-                .collect();
-            // The chain comes from the bundle's poses (jointly optimal over
-            // every observation at once; pairwise re-chaining would compound
-            // per-link errors again). The per-link estimates are still re-run
-            // on undistorted points for the Error Bound's link-quality terms,
-            // and the anchor is re-fit for its corner residual.
+        }) {
+            calib::CalibOutcome::Full(sc, chain) => (sc.k1, Some(chain), Some(sc)),
+            calib::CalibOutcome::DistortionOnly { k1, chain } => (k1, Some(chain), None),
+            calib::CalibOutcome::Refused => (0.0, None, None),
+        };
+        if let Some(bundle_chain) = bundle_chain {
+            let d2 = Distortion::new(width, height, k1_apply);
+            let du = undistort_all(&d2);
+            // The per-link estimates are still re-run on undistorted points
+            // for the Error Bound's link-quality terms, and the anchor is
+            // re-fit for its corner residual.
             let redo = estimate(
                 &world,
                 &du[ka].iter().find(|m| m.id == LEFT_MARKER_ID).unwrap().corners,
@@ -1776,7 +1805,7 @@ fn process(
                 w_chain = bundle_chain;
                 dist = d2;
                 dets_u = Some(du);
-                calibration = Some(sc);
+                calibration = sc;
             }
         }
     }
@@ -2241,6 +2270,7 @@ fn process(
         closure,
         closure_rejected,
         calibration,
+        applied_k1: dist.k1,
         bound,
         far_x_mm,
     })

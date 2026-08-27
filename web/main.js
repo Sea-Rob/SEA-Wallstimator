@@ -157,9 +157,13 @@ function wireScaleStep(nominalMm) {
 // Lens state for the status line (issue #6): which camera the capture is
 // actually using and whether zoom could be locked. Every path is honest —
 // "default rear lens" and "zoom not lockable" are reported, not hidden.
+// Reset at every openCamera so a retried capture never inherits a previous
+// camera's claims.
 const lens = { label: "default rear lens", zoom: "zoom not lockable in this browser" };
 
 async function openCamera() {
+  lens.label = "default rear lens";
+  lens.zoom = "zoom not lockable in this browser";
   if (!navigator.mediaDevices?.getUserMedia) {
     throw new Error("This browser does not support camera capture (getUserMedia).");
   }
@@ -182,17 +186,24 @@ async function openCamera() {
     const pick = pickMainRearCamera(devices);
     const currentId = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
     if (pick && pick.deviceId !== currentId) {
+      // Stop the facingMode stream BEFORE opening the pick: many Android
+      // camera HALs cannot hold two physical cameras open at once, and a
+      // concurrent open would fail with NotReadableError — leaving us on
+      // exactly the auxiliary lens this switch exists to escape.
+      for (const t of stream.getTracks()) t.stop();
       try {
-        const better = await navigator.mediaDevices.getUserMedia({
+        stream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: { deviceId: { exact: pick.deviceId }, width: { ideal: 1280 } },
         });
-        for (const t of stream.getTracks()) t.stop();
-        stream = better;
         lens.label = `main lens (${pick.label})`;
       } catch {
-        // The pick was refused (device busy/detached): the facingMode
-        // stream still works — keep it and say so.
+        // The pick was refused (device busy/detached): reopen the original
+        // facingMode stream (already stopped above) and say so.
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: "environment", width: { ideal: 1280 } },
+        });
         lens.label = "default rear lens (main-lens switch failed)";
       }
     } else if (pick) {
@@ -209,8 +220,15 @@ async function openCamera() {
   const lock = zoomLockConstraint(track?.getCapabilities?.());
   if (lock) {
     try {
+      // `advanced` constraint sets are best-effort per the spec — an
+      // unsatisfiable set is dropped WITHOUT rejection — so claiming the
+      // lock requires reading the setting back, not just not-throwing.
       await track.applyConstraints({ advanced: [lock] });
-      lens.zoom = `zoom locked ${lock.zoom}×`;
+      const applied = track.getSettings?.().zoom;
+      lens.zoom =
+        typeof applied === "number" && Math.abs(applied - lock.zoom) < 0.01
+          ? `zoom locked ${lock.zoom}×`
+          : "zoom lock not honoured by the camera";
     } catch {
       lens.zoom = "zoom lock refused by the camera";
     }
@@ -404,12 +422,18 @@ async function startCapture(wasm, version, isolated) {
         ? `print scale ×${session.printScale.correctionFactor.toFixed(4)}`
         : "print scale unverified";
       // Calibration state (issue #6): focal + k1 once a processed pan's
-      // self-calibration passed its conditioning gates, otherwise an
-      // explicit "uncalibrated" — never an invented focal.
-      const calibration = session.pan?.calibrated
-        ? `calibrated f ${session.pan.calibratedFocalPx.toFixed(0)} px, ` +
-          `k1 ${session.pan.calibratedK1.toFixed(3)}`
-        : "uncalibrated";
+      // self-calibration passed its conditioning gates; "distortion
+      // corrected" when only k1 proved itself; an explicit "uncalibrated"
+      // otherwise — never an invented focal.
+      const calibration = !session.pan
+        ? "no pan yet"
+        : session.pan.calibrated
+          ? `calibrated f ${session.pan.calibratedFocalPx.toFixed(0)} px, ` +
+            `k1 ${session.pan.calibratedK1.toFixed(3)}`
+          : session.pan.distortionCorrected
+            ? `distortion corrected (k1 ${session.pan.appliedK1.toFixed(3)}), ` +
+              "focal unclaimed"
+            : "uncalibrated";
       const parts = [
         `geometry-core v${version}`,
         `crossOriginIsolated: ${isolated}`,
@@ -641,6 +665,8 @@ function showPanResult(wasm, image) {
   const calibrated = image.calibrated();
   const calibratedFocalPx = image.calibrated_focal_px();
   const calibratedK1 = image.calibrated_k1();
+  const distortionCorrected = image.distortion_corrected();
+  const appliedK1 = image.applied_k1();
 
   // Sample the per-position bound component across the rendered extent
   // BEFORE the WASM object is freed, so the measure tool can show every
@@ -673,6 +699,8 @@ function showPanResult(wasm, image) {
     calibrated,
     calibratedFocalPx,
     calibratedK1,
+    distortionCorrected,
+    appliedK1,
     errorBoundNearMm: image.error_bound_near_mm(),
     errorBoundFarMm: image.error_bound_far_mm(),
     errorBoundWorstMm: image.error_bound_worst_mm(),
@@ -704,13 +732,17 @@ function showPanResult(wasm, image) {
   }
 
   const weakest = linkInliers.length ? Math.min(...linkInliers) : 0;
-  // Self-calibration outcome (issue #6), stated either way: a refused
-  // calibration is a wider bound, not a hidden one.
+  // Self-calibration outcome (issue #6), stated in all three cases: a
+  // refused calibration is a wider bound, not a hidden one, and a
+  // distortion-only result never invents a focal.
   const lensText = calibrated
     ? `Lens self-calibrated (focal ${calibratedFocalPx.toFixed(0)} px, ` +
       `k1 ${calibratedK1.toFixed(3)}).`
-    : "Lens uncalibrated (this pan couldn't support self-calibration; " +
-      "pinhole fallback with the wider Error Bound).";
+    : distortionCorrected
+      ? `Lens distortion corrected (k1 ${appliedK1.toFixed(3)}); focal ` +
+        "unclaimed (this pan had too little rotation to pin it)."
+      : "Lens uncalibrated (this pan couldn't support self-calibration; " +
+        "pinhole fallback with the wider Error Bound).";
   let summary =
     `Full-wall Rectified Wall Image stitched from ${keyframes} keyframes ` +
     `(${linkInliers.length} tracked links, weakest ${weakest} agreeing points): ` +
