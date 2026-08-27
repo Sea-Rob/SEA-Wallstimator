@@ -6,6 +6,8 @@
 // computation must multiply nominal printed dimensions by
 // `printScale.correctionFactor` to get real-world millimetres.
 
+import { isObstructionType } from "./obstruction-types.js";
+
 function blankState() {
   return {
     // null until the Homeowner has verified their printout's scale.
@@ -26,6 +28,15 @@ function blankState() {
     // Image). Null until the Homeowner explicitly confirms — later steps
     // (Obstruction tracing, fit checking) are gated on this being set.
     wallBounds: null,
+    // Typed Obstruction outlines (issue #8) in metric wall coordinates,
+    // mirroring what is traced on screen. Null until the tracing step is
+    // reached; a frozen EMPTY array is a real state (a blank wall). Their
+    // datum is the confirmed wallBounds record: anything that invalidates
+    // or replaces it (moving a guide, re-confirming, re-capturing) clears
+    // this too — outlines survive none of those honestly. The Exclusion
+    // Zones are deliberately NOT stored: they are derived (type buffer +
+    // geometry-core) and recomputed from these outlines on demand.
+    obstructions: null,
   };
 }
 
@@ -87,8 +98,10 @@ export function recordRectifiedWallImage({
     inliers,
   });
   // Bounds confirmed on a PREVIOUS image describe pixels that no longer
-  // exist — a re-capture always invalidates the confirmation.
+  // exist — a re-capture always invalidates the confirmation, and the
+  // Obstructions traced against that confirmation fall with it.
   session.wallBounds = null;
+  session.obstructions = null;
   return session.rectified;
 }
 
@@ -163,6 +176,7 @@ export function recordPanResult({
   // Same invalidation as the still path: a re-recorded pan replaces the
   // Rectified Wall Image the bounds were confirmed against.
   session.wallBounds = null;
+  session.obstructions = null;
   return session.pan;
 }
 
@@ -213,6 +227,9 @@ export function recordWallBounds({ leftXMm, rightXMm, topYMm, floorYMm, source }
     heightMm: floorYMm - topYMm,
     source,
   });
+  // A (re-)confirmation is a NEW datum: any Obstructions were traced
+  // against the previous rectangle and no longer describe this one.
+  session.obstructions = null;
   return session.wallBounds;
 }
 
@@ -223,10 +240,75 @@ export function recordWallBounds({ leftXMm, rightXMm, topYMm, floorYMm, source }
  */
 export function clearWallBounds() {
   session.wallBounds = null;
+  // The bounds are the Obstructions' datum: un-confirming them leaves any
+  // traced outlines anchored to nothing, so they are dropped too.
+  session.obstructions = null;
 }
 
 export function hasConfirmedWallBounds() {
   return session.wallBounds !== null;
+}
+
+/**
+ * Store the currently traced Obstruction outlines (issue #8) in metric wall
+ * coordinates, replacing any previous record — the UI calls this after
+ * every edit so the session always mirrors the screen. Requires confirmed
+ * Wall bounds (the outlines' datum). Each entry must carry a type from the
+ * reviewable config (web/obstruction-types.js) and a finite, non-degenerate
+ * rectangle inside the confirmed bounds — the UI's clamping makes anything
+ * else impossible, so a violation is a buggy caller and the whole batch is
+ * refused rather than stored half-trusted. An EMPTY list is a valid record:
+ * "the Homeowner reached this step and traced nothing" is a real answer on
+ * a blank wall, distinct from null ("never got here / invalidated").
+ */
+export function recordObstructions(list) {
+  if (!session.printScale || !session.captureStarted || !session.wallBounds) {
+    return null;
+  }
+  if (!Array.isArray(list)) {
+    return null;
+  }
+  const b = session.wallBounds;
+  // Outlines are clamped to the bounds in image px and converted through
+  // floats: half a millimetre of slack absorbs the rounding without ever
+  // accepting an outline meaningfully outside the Wall.
+  const slackMm = 0.5;
+  for (const o of list) {
+    const values = [o.leftXMm, o.topYMm, o.rightXMm, o.bottomYMm];
+    if (!values.every(Number.isFinite) || o.rightXMm <= o.leftXMm || o.bottomYMm <= o.topYMm) {
+      return null;
+    }
+    if (!isObstructionType(o.type)) {
+      return null;
+    }
+    if (
+      o.leftXMm < b.leftXMm - slackMm ||
+      o.rightXMm > b.rightXMm + slackMm ||
+      o.topYMm < b.topYMm - slackMm ||
+      o.bottomYMm > b.floorYMm + slackMm
+    ) {
+      return null;
+    }
+  }
+  session.obstructions = Object.freeze(
+    list.map((o) =>
+      Object.freeze({
+        leftXMm: o.leftXMm,
+        topYMm: o.topYMm,
+        rightXMm: o.rightXMm,
+        bottomYMm: o.bottomYMm,
+        type: o.type,
+      }),
+    ),
+  );
+  return session.obstructions;
+}
+
+/** Drop the Obstruction record without touching the bounds (unused by the
+ *  current flow — every invalidation path above clears it already — but the
+ *  reset story should not depend on that). */
+export function clearObstructions() {
+  session.obstructions = null;
 }
 
 export function hasVerifiedPrintScale() {

@@ -310,3 +310,122 @@ test("clearWallBounds drops the record (guide moved after confirm) and reset cle
   resetSession();
   assert.equal(session.wallBounds, null);
 });
+
+// --- Obstructions (issue #8 slice) ------------------------------------------
+
+const { recordObstructions, clearObstructions } = await import("../session.js");
+
+// Inside the BOUNDS fixture's rectangle (x 60..3180 mm, y -30..620 mm).
+const OBSTRUCTIONS = [
+  { leftXMm: 500, topYMm: 100, rightXMm: 1400, bottomYMm: 550, type: "window" },
+  { leftXMm: 2000, topYMm: -20, rightXMm: 2060, bottomYMm: 600, type: "pipe" },
+];
+
+function confirmedSession() {
+  startedSession();
+  recordPanResult(PAN);
+  recordWallBounds(BOUNDS);
+}
+
+test("obstructions cannot be recorded before the wall bounds are confirmed", () => {
+  resetSession();
+  assert.equal(recordObstructions(OBSTRUCTIONS), null);
+
+  startedSession();
+  recordPanResult(PAN);
+  // Image present, bounds not confirmed: the outlines would have no datum.
+  assert.equal(recordObstructions(OBSTRUCTIONS), null);
+  assert.equal(session.obstructions, null);
+});
+
+test("obstructions store frozen metric outlines with their types, in order", () => {
+  confirmedSession();
+  const stored = recordObstructions(OBSTRUCTIONS);
+  assert.equal(stored, session.obstructions);
+  assert.ok(Object.isFrozen(stored), "list must be immutable");
+  assert.equal(stored.length, 2);
+  assert.ok(Object.isFrozen(stored[0]), "entries must be immutable");
+  assert.equal(stored[0].type, "window");
+  assert.equal(stored[0].leftXMm, 500);
+  assert.equal(stored[1].type, "pipe");
+  assert.equal(stored[1].bottomYMm, 600);
+});
+
+test("an empty list is a real record (blank wall), distinct from null", () => {
+  confirmedSession();
+  const stored = recordObstructions([]);
+  assert.ok(stored, "empty list must store");
+  assert.equal(stored.length, 0);
+  assert.notEqual(session.obstructions, null);
+});
+
+test("re-recording replaces the whole list (the UI mirrors every edit)", () => {
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  const again = recordObstructions([OBSTRUCTIONS[1]]);
+  assert.equal(session.obstructions, again);
+  assert.equal(again.length, 1);
+  assert.equal(again[0].type, "pipe");
+});
+
+test("unknown types, degenerate and non-finite outlines are refused whole-batch", () => {
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  const bad = (patch) => [OBSTRUCTIONS[0], { ...OBSTRUCTIONS[1], ...patch }];
+  assert.equal(recordObstructions(bad({ type: "skylight" })), null);
+  assert.equal(recordObstructions(bad({ rightXMm: 2000 })), null, "zero width");
+  assert.equal(recordObstructions(bad({ bottomYMm: -20 })), null, "zero height");
+  assert.equal(recordObstructions(bad({ leftXMm: NaN })), null);
+  assert.equal(recordObstructions("not a list"), null);
+  // The prior good record survives a refused batch untouched.
+  assert.equal(session.obstructions.length, 2);
+});
+
+test("outlines outside the confirmed bounds are refused (containment cross-check)", () => {
+  confirmedSession(); // bounds: x 60..3180, y -30..620 (floor)
+  const bad = (patch) => [{ ...OBSTRUCTIONS[0], ...patch }];
+  assert.equal(recordObstructions(bad({ leftXMm: 40 })), null, "left of the wall");
+  assert.equal(recordObstructions(bad({ rightXMm: 3200 })), null, "right of the wall");
+  assert.equal(recordObstructions(bad({ topYMm: -50 })), null, "above the wall");
+  assert.equal(recordObstructions(bad({ bottomYMm: 650 })), null, "below the Floor Line");
+  // Flush against the bounds (within the half-millimetre slack) is fine.
+  assert.ok(
+    recordObstructions(bad({ leftXMm: 60, rightXMm: 3180, topYMm: -30, bottomYMm: 620 })),
+  );
+});
+
+test("re-confirming or un-confirming the bounds clears obstructions: their datum moved", () => {
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  assert.ok(session.obstructions);
+  recordWallBounds(BOUNDS); // re-confirmed, even with identical numbers
+  assert.equal(session.obstructions, null);
+
+  recordObstructions(OBSTRUCTIONS);
+  clearWallBounds(); // a guide moved after confirming
+  assert.equal(session.obstructions, null);
+});
+
+test("re-capturing clears obstructions along with the bounds", () => {
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  recordPanResult(PAN); // re-recorded pan
+  assert.equal(session.obstructions, null);
+
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  recordRectifiedWallImage(RECT); // re-captured still
+  assert.equal(session.obstructions, null);
+});
+
+test("clearObstructions and resetSession drop the record", () => {
+  confirmedSession();
+  recordObstructions(OBSTRUCTIONS);
+  clearObstructions();
+  assert.equal(session.obstructions, null);
+  assert.ok(session.wallBounds, "clearing obstructions must not touch the bounds");
+
+  recordObstructions(OBSTRUCTIONS);
+  resetSession();
+  assert.equal(session.obstructions, null);
+});

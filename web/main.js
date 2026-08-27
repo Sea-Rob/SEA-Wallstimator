@@ -19,13 +19,12 @@ import init, {
   FrameProcessor,
   PanRecorder,
   core_version,
+  exclusion_zones_mm,
   ruler_nominal_mm,
 } from "./pkg/geometry_core.js";
 import { evaluateRulerMeasurement } from "./print-scale.js";
 import { pickMainRearCamera, zoomLockConstraint } from "./camera.js";
 import {
-  initialGuides,
-  moveGuide,
   fitTransform,
   imageToView,
   viewToImage,
@@ -33,9 +32,21 @@ import {
   zoomAt,
   panBy,
   pinchTransform,
-  hitGuide,
-  guidesToWallMm,
-} from "./wall-bounds.js";
+} from "./view-transform.js";
+import { initialGuides, moveGuide, hitGuide, guidesToWallMm } from "./wall-bounds.js";
+import { OBSTRUCTION_TYPES, DEFAULT_OBSTRUCTION_TYPE } from "./obstruction-types.js";
+import {
+  traceRect,
+  meetsMinSize,
+  moveRectBy,
+  resizeRect,
+  hitObstruction,
+  rectToWallMm,
+  rectFromWallMm,
+  wallBoundsToImagePx,
+  packObstructionsMm,
+  unpackZonesMm,
+} from "./obstructions.js";
 import {
   session,
   recordPrintScale,
@@ -43,6 +54,8 @@ import {
   recordPanResult,
   recordWallBounds,
   clearWallBounds,
+  recordObstructions,
+  hasConfirmedWallBounds,
   hasVerifiedPrintScale,
   lockForCapture,
 } from "./session.js";
@@ -81,6 +94,13 @@ const confirmBoundsBtn = document.getElementById("confirm-bounds");
 const resetGuidesBtn = document.getElementById("reset-guides");
 const boundsSummary = document.getElementById("bounds-summary");
 const boundsGate = document.getElementById("bounds-gate");
+const obstSection = document.getElementById("step-obstructions");
+const obstCanvas = document.getElementById("obstructions-canvas");
+const obstCtx = obstCanvas.getContext("2d");
+const obstTypeSelect = document.getElementById("obstruction-type");
+const traceObstructionBtn = document.getElementById("trace-obstruction");
+const deleteObstructionBtn = document.getElementById("delete-obstruction");
+const obstSummary = document.getElementById("obstructions-summary");
 
 // Debug / test handle: lets DevTools (and smoke tests) inspect session state.
 window.wallstimatorSession = session;
@@ -666,8 +686,9 @@ function wireMeasureTool() {
 // (Obstruction tracing, fit checking). All coordinate math lives in the pure
 // wall-bounds.js module — this block only routes pointer events and draws.
 
-// Finger-sized grab distance for a guide, in CSS pixels: measured in view
-// space so zooming in refines placement without shrinking the target.
+// Finger-sized grab distance for a guide or an Obstruction handle, in CSS
+// pixels: measured in view space so zooming in refines placement without
+// shrinking the target.
 const HANDLE_SLOP_CSS_PX = 26;
 
 // Guide clamping guardrail, NOT a product judgement: guides can't be pushed
@@ -679,33 +700,185 @@ const bounds = {
   meta: null, // {widthPx, heightPx, mmPerPx, originXMm, originYMm, source}
   image: null, // offscreen canvas holding the rectified pixels
   guides: null, // image-px guide positions (wall-bounds.js shape)
-  view: null, // zoom/pan transform image->view (wall-bounds.js shape)
+  view: null, // zoom/pan transform image->view (view-transform.js shape)
   minGapPx: 0,
   confirmed: false,
   // The Floor Line pre-placement is a guess; Confirm stays disabled until
   // the Homeowner has grabbed the floor guide at least once.
   floorEngaged: false,
-  pointers: new Map(), // active pointerId -> [x, y] view px
-  mode: null, // {type:"drag", guide} | {type:"pan"} | {type:"pinch"}
 };
 
-/** Match the canvas backing store to its CSS box (times devicePixelRatio)
- *  so guide lines stay crisp; the view transform works in backing px. */
-function sizeBoundsCanvas() {
-  const rect = boundsCanvas.getBoundingClientRect();
+/** Match a canvas' backing store to its CSS box (times devicePixelRatio)
+ *  so lines stay crisp; the view transform works in backing px. */
+function sizeImageCanvas(canvas) {
+  const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const w = Math.max(2, Math.round(rect.width * dpr));
   const h = Math.max(2, Math.round(rect.height * dpr));
-  if (boundsCanvas.width !== w || boundsCanvas.height !== h) {
-    boundsCanvas.width = w;
-    boundsCanvas.height = h;
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
   }
 }
 
 /** Backing pixels per CSS pixel — sizes strokes/handles/slop finger-true. */
-function boundsUnit() {
-  const rect = boundsCanvas.getBoundingClientRect();
-  return rect.width > 0 ? boundsCanvas.width / rect.width : 1;
+function canvasUnit(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return rect.width > 0 ? canvas.width / rect.width : 1;
+}
+
+const sizeBoundsCanvas = () => sizeImageCanvas(boundsCanvas);
+const boundsUnit = () => canvasUnit(boundsCanvas);
+
+// ---------------------------------------------------------------------------
+// Shared gesture wiring for the zoomable Rectified-Wall-Image canvases
+// (step 5 bounds, step 6 obstructions): pointer bookkeeping, two-finger
+// pinch-zoom, one-finger pan fallback, wheel zoom, and canvas/view upkeep on
+// window resize — extracted from the issue #7 bounds step so both steps
+// share one gesture feel instead of two drifting copies. The step-specific
+// single-pointer behaviour (dragging a guide, tracing an outline) plugs in
+// via `h.beginSingle`, which either claims the pointer with a drag handler
+// or declines (null) to get the default image pan.
+//
+//   h.enabled()             — step armed with an image
+//   h.imageSize()           — [w, h] image px
+//   h.getView() / h.setView(t)
+//   h.sizeCanvas()          — match the backing store to the CSS box
+//   h.draw()
+//   h.beginSingle(p)        — {move(p), end()?, cancel()?} | null (view px);
+//                             `end` fires on release, `cancel` when a second
+//                             finger converts the gesture into a pinch.
+//   h.tap(p)                — optional: a single pointer went down and up
+//                             without claiming a drag or really panning.
+
+/** A pan that moved less than this (CSS px) was a tap, not a pan. */
+const TAP_SLOP_CSS_PX = 8;
+
+function wireImageGestures(canvas, h) {
+  const pointers = new Map(); // active pointerId -> [x, y] view px
+  let mode = null; // {type:"drag", drag} | {type:"pan", moved} | {type:"pinch"}
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (!h.enabled()) return;
+    event.preventDefault();
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch {
+      // No capturable pointer (synthetic events, some stylus edge cases):
+      // the drag still works, it just loses the off-canvas grace capture.
+    }
+    pointers.set(event.pointerId, canvasPoint(canvas, event));
+    if (pointers.size === 2) {
+      // Second finger always switches to pinch — even mid guide-drag or
+      // mid-trace: the Homeowner is asking for precision, not a bigger
+      // drag. A claimed drag gets told (cancel), never silently dropped.
+      if (mode?.type === "drag") mode.drag.cancel?.();
+      mode = { type: "pinch" };
+    } else if (pointers.size === 1) {
+      const p = pointers.get(event.pointerId);
+      const drag = h.beginSingle(p);
+      mode = drag ? { type: "drag", drag } : { type: "pan", moved: 0 };
+    }
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    if (!h.enabled() || !pointers.has(event.pointerId)) return;
+    event.preventDefault();
+    const p = canvasPoint(canvas, event);
+    const prev = pointers.get(event.pointerId);
+    const [iw, ih] = h.imageSize();
+    const [vw, vh] = [canvas.width, canvas.height];
+
+    if (mode?.type === "pinch" && pointers.size >= 2) {
+      const ids = [...pointers.keys()].slice(0, 2);
+      if (!ids.includes(event.pointerId)) {
+        // Stray 3rd finger: not part of the pinch, but keep its stored
+        // position fresh — if a tracked finger lifts, this one may be
+        // promoted into the pinch pair and a stale position would inject
+        // one frame of garbage delta.
+        pointers.set(event.pointerId, p);
+        return;
+      }
+      const before = ids.map((id) => pointers.get(id));
+      pointers.set(event.pointerId, p);
+      const after = ids.map((id) => pointers.get(id));
+      h.setView(pinchTransform(h.getView(), before, after, iw, ih, vw, vh));
+      h.draw();
+      return;
+    }
+
+    pointers.set(event.pointerId, p);
+    if (mode?.type === "drag") {
+      mode.drag.move(p);
+    } else if (mode?.type === "pan") {
+      mode.moved += Math.hypot(p[0] - prev[0], p[1] - prev[1]);
+      h.setView(panBy(h.getView(), p[0] - prev[0], p[1] - prev[1], iw, ih, vw, vh));
+      h.draw();
+    }
+  });
+
+  const releasePointer = (event, upNotCancel) => {
+    if (!pointers.delete(event.pointerId)) return;
+    if (pointers.size === 0) {
+      const ending = mode;
+      mode = null;
+      if (ending?.type === "drag") {
+        if (upNotCancel) {
+          ending.drag.end?.();
+        } else {
+          ending.drag.cancel?.();
+        }
+      } else if (
+        upNotCancel &&
+        ending?.type === "pan" &&
+        ending.moved <= TAP_SLOP_CSS_PX * canvasUnit(canvas)
+      ) {
+        h.tap?.(canvasPoint(canvas, event));
+      }
+    } else if (pointers.size === 1 && mode?.type === "pinch") {
+      // Lifted one pinch finger: keep panning (a pinch is never a tap).
+      mode = { type: "pan", moved: Infinity };
+    }
+  };
+  canvas.addEventListener("pointerup", (event) => releasePointer(event, true));
+  canvas.addEventListener("pointercancel", (event) => releasePointer(event, false));
+
+  // Desktop precision without touch: wheel zooms about the cursor.
+  canvas.addEventListener(
+    "wheel",
+    (event) => {
+      if (!h.enabled()) return;
+      event.preventDefault();
+      // Horizontal trackpad scrolls deliver deltaY 0 — that is not a zoom
+      // request in either direction.
+      if (event.deltaY === 0) return;
+      const [iw, ih] = h.imageSize();
+      h.setView(
+        zoomAt(
+          h.getView(),
+          canvasPoint(canvas, event),
+          event.deltaY < 0 ? 1.2 : 1 / 1.2,
+          iw,
+          ih,
+          canvas.width,
+          canvas.height,
+        ),
+      );
+      h.draw();
+    },
+    { passive: false },
+  );
+
+  // Rotating the phone / resizing the window reshapes the canvas box: keep
+  // the backing store matched and re-clamp the view (overlays are image-px
+  // state, so they survive untouched).
+  window.addEventListener("resize", () => {
+    if (!h.enabled()) return;
+    h.sizeCanvas();
+    const [iw, ih] = h.imageSize();
+    h.setView(clampTransform(h.getView(), iw, ih, canvas.width, canvas.height));
+    h.draw();
+  });
 }
 
 function drawBounds() {
@@ -793,9 +966,9 @@ function updateBoundsGate() {
       `(stored in wall coordinates from the ${b.source === "pan" ? "recorded pan" : "captured frame"}).`;
     boundsGate.className = "result ok";
     boundsGate.textContent =
-      "Wall bounds and Floor Line locked in — the next step (tracing " +
-      "Obstructions) will work inside them. Moving any guide unlocks " +
-      "re-confirmation.";
+      "Wall bounds and Floor Line locked in — trace the Obstructions in the " +
+      "step below. Moving any guide re-locks that step (and clears its " +
+      "tracings: they were measured against these bounds).";
   } else {
     const mm = guidesToWallMm(bounds.guides, bounds.meta);
     boundsSummary.className = "result ok";
@@ -812,11 +985,13 @@ function updateBoundsGate() {
   }
 }
 
-/** A guide moved: any prior confirmation no longer describes the screen. */
+/** A guide moved: any prior confirmation no longer describes the screen —
+ *  and any Obstructions traced against it lose their datum with it. */
 function unconfirmBounds() {
   if (!bounds.confirmed) return;
   bounds.confirmed = false;
   clearWallBounds();
+  hideObstructionsStep();
 }
 
 function confirmBounds() {
@@ -833,6 +1008,7 @@ function confirmBounds() {
   }
   bounds.confirmed = true;
   updateBoundsGate();
+  showObstructionsStep();
 }
 
 /**
@@ -859,9 +1035,10 @@ function showBoundsStep(meta) {
   );
   bounds.confirmed = false;
   bounds.floorEngaged = false;
-  bounds.pointers.clear();
-  bounds.mode = null;
   boundsSection.hidden = false;
+  // A fresh image also tears down the obstruction step: session.js already
+  // dropped both records, and the pixels its outlines sat on are gone.
+  hideObstructionsStep();
   sizeBoundsCanvas();
   bounds.view = fitTransform(meta.widthPx, meta.heightPx, boundsCanvas.width, boundsCanvas.height);
   drawBounds();
@@ -869,122 +1046,50 @@ function showBoundsStep(meta) {
 }
 
 function wireBoundsStep() {
-  const viewSize = () => [boundsCanvas.width, boundsCanvas.height];
-
-  boundsCanvas.addEventListener("pointerdown", (event) => {
-    if (!bounds.image) return;
-    event.preventDefault();
-    try {
-      boundsCanvas.setPointerCapture(event.pointerId);
-    } catch {
-      // No capturable pointer (synthetic events, some stylus edge cases):
-      // the drag still works, it just loses the off-canvas grace capture.
-    }
-    bounds.pointers.set(event.pointerId, canvasPoint(boundsCanvas, event));
-    if (bounds.pointers.size === 2) {
-      // Second finger always switches to pinch — even mid guide-drag: the
-      // Homeowner is asking for precision, not a bigger drag.
-      bounds.mode = { type: "pinch" };
-    } else if (bounds.pointers.size === 1) {
-      const p = bounds.pointers.get(event.pointerId);
+  wireImageGestures(boundsCanvas, {
+    enabled: () => bounds.image !== null,
+    imageSize: () => [bounds.meta.widthPx, bounds.meta.heightPx],
+    getView: () => bounds.view,
+    setView: (t) => {
+      bounds.view = t;
+    },
+    sizeCanvas: sizeBoundsCanvas,
+    draw: drawBounds,
+    beginSingle: (p) => {
       const guide = hitGuide(bounds.guides, bounds.view, p, HANDLE_SLOP_CSS_PX * boundsUnit());
-      bounds.mode = guide ? { type: "drag", guide } : { type: "pan" };
+      if (!guide) return null; // not on a guide: the default pan
       if (guide === "floor" && !bounds.floorEngaged) {
         // Grabbing the Floor Line counts as engaging with it (even a grab
         // that ends where it started is a deliberate aim at the datum).
         bounds.floorEngaged = true;
         updateBoundsGate();
       }
-    }
-  });
-
-  boundsCanvas.addEventListener("pointermove", (event) => {
-    if (!bounds.image || !bounds.pointers.has(event.pointerId)) return;
-    event.preventDefault();
-    const p = canvasPoint(boundsCanvas, event);
-    const prev = bounds.pointers.get(event.pointerId);
-    const m = bounds.meta;
-    const [vw, vh] = viewSize();
-
-    if (bounds.mode?.type === "pinch" && bounds.pointers.size >= 2) {
-      const ids = [...bounds.pointers.keys()].slice(0, 2);
-      if (!ids.includes(event.pointerId)) {
-        // Stray 3rd finger: not part of the pinch, but keep its stored
-        // position fresh — if a tracked finger lifts, this one may be
-        // promoted into the pinch pair and a stale position would inject
-        // one frame of garbage delta.
-        bounds.pointers.set(event.pointerId, p);
-        return;
-      }
-      const before = ids.map((id) => bounds.pointers.get(id));
-      bounds.pointers.set(event.pointerId, p);
-      const after = ids.map((id) => bounds.pointers.get(id));
-      bounds.view = pinchTransform(bounds.view, before, after, m.widthPx, m.heightPx, vw, vh);
-      drawBounds();
-      return;
-    }
-
-    bounds.pointers.set(event.pointerId, p);
-    if (bounds.mode?.type === "drag") {
-      const [ix, iy] = viewToImage(bounds.view, p);
-      const alongX = bounds.mode.guide === "left" || bounds.mode.guide === "right";
-      const moved = moveGuide(
-        bounds.guides,
-        bounds.mode.guide,
-        alongX ? ix : iy,
-        m.widthPx,
-        m.heightPx,
-        bounds.minGapPx,
-      );
-      // Only a drag that actually changed a value invalidates a prior
-      // confirmation: a tap's pixel of jitter, or a drag fully absorbed by
-      // clamping, leaves the confirmed record still describing the screen.
-      if (moved[bounds.mode.guide] !== bounds.guides[bounds.mode.guide]) {
-        bounds.guides = moved;
-        unconfirmBounds();
-        drawBounds();
-        updateBoundsGate();
-      }
-    } else if (bounds.mode?.type === "pan") {
-      bounds.view = panBy(bounds.view, p[0] - prev[0], p[1] - prev[1], m.widthPx, m.heightPx, vw, vh);
-      drawBounds();
-    }
-  });
-
-  const releasePointer = (event) => {
-    if (!bounds.pointers.delete(event.pointerId)) return;
-    if (bounds.pointers.size === 0) {
-      bounds.mode = null;
-    } else if (bounds.pointers.size === 1 && bounds.mode?.type === "pinch") {
-      bounds.mode = { type: "pan" }; // lifted one pinch finger: keep panning
-    }
-  };
-  boundsCanvas.addEventListener("pointerup", releasePointer);
-  boundsCanvas.addEventListener("pointercancel", releasePointer);
-
-  // Desktop precision without touch: wheel zooms about the cursor.
-  boundsCanvas.addEventListener(
-    "wheel",
-    (event) => {
-      if (!bounds.image) return;
-      event.preventDefault();
-      // Horizontal trackpad scrolls deliver deltaY 0 — that is not a zoom
-      // request in either direction.
-      if (event.deltaY === 0) return;
-      const m = bounds.meta;
-      bounds.view = zoomAt(
-        bounds.view,
-        canvasPoint(boundsCanvas, event),
-        event.deltaY < 0 ? 1.2 : 1 / 1.2,
-        m.widthPx,
-        m.heightPx,
-        boundsCanvas.width,
-        boundsCanvas.height,
-      );
-      drawBounds();
+      return {
+        move: (q) => {
+          const [ix, iy] = viewToImage(bounds.view, q);
+          const alongX = guide === "left" || guide === "right";
+          const moved = moveGuide(
+            bounds.guides,
+            guide,
+            alongX ? ix : iy,
+            bounds.meta.widthPx,
+            bounds.meta.heightPx,
+            bounds.minGapPx,
+          );
+          // Only a drag that actually changed a value invalidates a prior
+          // confirmation: a tap's pixel of jitter, or a drag fully absorbed
+          // by clamping, leaves the confirmed record still describing the
+          // screen.
+          if (moved[guide] !== bounds.guides[guide]) {
+            bounds.guides = moved;
+            unconfirmBounds();
+            drawBounds();
+            updateBoundsGate();
+          }
+        },
+      };
     },
-    { passive: false },
-  );
+  });
 
   confirmBoundsBtn.addEventListener("click", confirmBounds);
   resetGuidesBtn.addEventListener("click", () => {
@@ -998,21 +1103,460 @@ function wireBoundsStep() {
     drawBounds();
     updateBoundsGate();
   });
+}
 
-  // Rotating the phone / resizing the window reshapes the canvas box: keep
-  // the backing store matched and re-clamp the view (guides are image-px
-  // state, so they survive untouched).
-  window.addEventListener("resize", () => {
-    if (!bounds.image) return;
-    sizeBoundsCanvas();
-    bounds.view = clampTransform(
-      bounds.view,
-      bounds.meta.widthPx,
-      bounds.meta.heightPx,
-      boundsCanvas.width,
-      boundsCanvas.height,
+// ---------------------------------------------------------------------------
+// Step 6 — Obstruction tracing with typed Exclusion Zones (issue #8).
+//
+// Gated on the explicit wall-bounds confirmation (hasConfirmedWallBounds):
+// the Homeowner traces rectangles over Obstructions on the same Rectified
+// Wall Image, types each one (window, door, pipe, …), and sees the typed
+// compliance buffer as a red hatched Exclusion Zone around the outline —
+// 600 mm past a window's edge, nothing past a pipe's. Outlines live in
+// image px here; the session record and the zone computation are in metric
+// wall coordinates (the Rust core inflates and clips — see
+// crates/geometry-core/src/exclusion.rs). All coordinate math lives in the
+// pure obstructions.js module; this block only routes pointer events, calls
+// the core, and draws.
+
+// Smallest traceable Obstruction side (mm): below this a "rectangle" is
+// finger noise, not a wall feature — even a conduit is ~20 mm wide.
+const MIN_OBSTRUCTION_MM = 20;
+
+const obst = {
+  meta: null, // same shape as bounds.meta
+  image: null, // shares bounds.image (same rectified pixels)
+  wallPx: null, // confirmed wall bounds as an image-px rect (the clamp region)
+  list: [], // [{left, top, right, bottom, type}] image px
+  zonesPx: [], // Exclusion Zones from the core, image px, parallel to list
+  selected: -1,
+  view: null,
+  minSizePx: 0,
+  traceArmed: false, // "Trace obstruction" pressed; next drag traces
+  tracePreview: null, // live rect while the tracing finger is down
+};
+
+const sizeObstCanvas = () => sizeImageCanvas(obstCanvas);
+const obstUnit = () => canvasUnit(obstCanvas);
+
+/** Diagonal hatching clipped to a rectangle — the Exclusion Zone texture.
+ *  Distinct from any solid outline at a glance, and it reads as "keep out"
+ *  even where zones overlap each other or their own outline. */
+function hatchRect(ctx, x, y, w, h, spacingPx, style, widthPx) {
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.strokeStyle = style;
+  ctx.lineWidth = widthPx;
+  ctx.beginPath();
+  for (let d = -h; d < w; d += spacingPx) {
+    ctx.moveTo(x + d, y + h);
+    ctx.lineTo(x + d + h, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawObstructions() {
+  const W = obstCanvas.width;
+  const H = obstCanvas.height;
+  const t = obst.view;
+  const u = obstUnit();
+
+  obstCtx.setTransform(1, 0, 0, 1, 0, 0);
+  obstCtx.fillStyle = "#000";
+  obstCtx.fillRect(0, 0, W, H);
+  obstCtx.setTransform(t.scale, 0, 0, t.scale, t.tx, t.ty);
+  obstCtx.drawImage(obst.image, 0, 0);
+  obstCtx.setTransform(1, 0, 0, 1, 0, 0);
+
+  const viewRect = (r) => {
+    const [l, tp] = imageToView(t, [r.left, r.top]);
+    const [rr, b] = imageToView(t, [r.right, r.bottom]);
+    return [l, tp, rr - l, b - tp];
+  };
+
+  // Dim everything outside the confirmed wall bounds: Obstructions can only
+  // be traced on the Wall, and the dimming says so without a word.
+  const [wl, wt, ww, wh] = viewRect(obst.wallPx);
+  obstCtx.fillStyle = "rgba(0, 0, 0, 0.5)";
+  obstCtx.fillRect(0, 0, wl, H);
+  obstCtx.fillRect(wl + ww, 0, W - wl - ww, H);
+  obstCtx.fillRect(wl, 0, ww, wt);
+  obstCtx.fillRect(wl, wt + wh, ww, H - wt - wh);
+
+  // Exclusion Zones first (under the outlines): translucent red wash +
+  // diagonal hatching + dashed edge — unmistakably a different KIND of
+  // overlay from the solid outline it surrounds. A zero-buffer zone sits
+  // exactly under its outline and disappears behind it, which is the truth.
+  const ZONE = "rgba(255, 82, 82, 0.9)";
+  for (const zone of obst.zonesPx) {
+    const [x, y, w, h] = viewRect(zone);
+    obstCtx.fillStyle = "rgba(255, 82, 82, 0.15)";
+    obstCtx.fillRect(x, y, w, h);
+    hatchRect(obstCtx, x, y, w, h, 14 * u, "rgba(255, 82, 82, 0.45)", 1.5 * u);
+    obstCtx.strokeStyle = ZONE;
+    obstCtx.lineWidth = 1.5 * u;
+    obstCtx.setLineDash([6 * u, 5 * u]);
+    obstCtx.strokeRect(x, y, w, h);
+    obstCtx.setLineDash([]);
+  }
+
+  // Obstruction outlines: one solid style + a type label; the selected one
+  // gets a white stroke and corner handles (the resize affordance).
+  const OUTLINE = "#5ad1ff";
+  obst.list.forEach((o, i) => {
+    const [x, y, w, h] = viewRect(o);
+    const isSelected = i === obst.selected;
+    obstCtx.fillStyle = "rgba(90, 209, 255, 0.12)";
+    obstCtx.fillRect(x, y, w, h);
+    obstCtx.strokeStyle = isSelected ? "#fff" : OUTLINE;
+    obstCtx.lineWidth = (isSelected ? 3 : 2) * u;
+    obstCtx.strokeRect(x, y, w, h);
+
+    const label = OBSTRUCTION_TYPES[o.type].label;
+    obstCtx.font = `${12 * u}px system-ui, sans-serif`;
+    const pad = 4 * u;
+    const tw = obstCtx.measureText(label).width;
+    obstCtx.fillStyle = "rgba(0, 0, 0, 0.65)";
+    obstCtx.fillRect(x, y, tw + 2 * pad, 18 * u);
+    obstCtx.fillStyle = isSelected ? "#fff" : OUTLINE;
+    obstCtx.fillText(label, x + pad, y + 13 * u);
+
+    if (isSelected) {
+      for (const [cx, cy] of [
+        [x, y],
+        [x + w, y],
+        [x, y + h],
+        [x + w, y + h],
+      ]) {
+        obstCtx.fillStyle = "#fff";
+        obstCtx.strokeStyle = "#111";
+        obstCtx.lineWidth = 2 * u;
+        obstCtx.beginPath();
+        obstCtx.arc(cx, cy, 9 * u, 0, 2 * Math.PI);
+        obstCtx.fill();
+        obstCtx.stroke();
+      }
+    }
+  });
+
+  // Live trace preview: dashed, no label yet — it becomes an Obstruction
+  // (and gets its zone) on release, if it is big enough to be real.
+  if (obst.tracePreview) {
+    const [x, y, w, h] = viewRect(obst.tracePreview);
+    obstCtx.strokeStyle = "#fff";
+    obstCtx.lineWidth = 2 * u;
+    obstCtx.setLineDash([8 * u, 6 * u]);
+    obstCtx.strokeRect(x, y, w, h);
+    obstCtx.setLineDash([]);
+  }
+}
+
+function showObstructionsSummary(kind, message) {
+  obstSummary.className = `result ${kind}`;
+  obstSummary.textContent = message;
+}
+
+function updateObstructionControls() {
+  deleteObstructionBtn.disabled = obst.selected < 0;
+  traceObstructionBtn.textContent = obst.traceArmed
+    ? "Now drag on the image…"
+    : "Trace obstruction";
+  if (obst.selected >= 0) {
+    obstTypeSelect.value = obst.list[obst.selected].type;
+  }
+}
+
+/** One line describing what is stored, e.g. "2 windows, 1 pipe". */
+function obstructionCensus() {
+  const counts = new Map();
+  for (const o of obst.list) {
+    counts.set(o.type, (counts.get(o.type) ?? 0) + 1);
+  }
+  return [...counts]
+    .map(([type, n]) => `${n} ${OBSTRUCTION_TYPES[type].label.toLowerCase()}${n > 1 ? "s" : ""}`)
+    .join(", ");
+}
+
+/**
+ * The one mutation funnel: after EVERY edit (trace, move, resize, retype,
+ * delete) recompute the Exclusion Zones in the core, mirror the outlines
+ * into the session record in metric wall coordinates, and redraw. Zones are
+ * never cached across edits, so screen, session and core can't disagree.
+ */
+function syncObstructions() {
+  if (!obst.meta) return;
+  const b = session.wallBounds;
+  try {
+    const { outlines, buffers } = packObstructionsMm(obst.list, obst.meta);
+    const wallMm = new Float64Array([b.leftXMm, b.topYMm, b.rightXMm, b.floorYMm]);
+    const zones = unpackZonesMm(exclusion_zones_mm(outlines, buffers, wallMm));
+    obst.zonesPx = zones.map((z) => rectFromWallMm(z, obst.meta));
+  } catch (err) {
+    // Should be unreachable (outlines are clamped inside the wall), but a
+    // stale zone overlay lying about clearances would be worse than a bang.
+    showObstructionsSummary("warn", "Could not compute Exclusion Zones: " + errMsg(err));
+    obst.zonesPx = [];
+    drawObstructions();
+    return;
+  }
+  const stored = recordObstructions(
+    obst.list.map((o) => ({ ...rectToWallMm(o, obst.meta), type: o.type })),
+  );
+  if (!stored) {
+    showObstructionsSummary(
+      "warn",
+      "Could not store the Obstructions — re-confirm the wall bounds and try again.",
     );
-    drawBounds();
+    drawObstructions();
+    return;
+  }
+  drawObstructions();
+  updateObstructionControls();
+  if (stored.length === 0) {
+    showObstructionsSummary(
+      "ok",
+      "No Obstructions traced yet. Pick a type and press “Trace obstruction”, " +
+        "then drag a rectangle over each window, door, pipe, meter box or " +
+        "vent on the wall. A blank wall needs nothing here.",
+    );
+  } else {
+    const buffered = stored.filter((o) => OBSTRUCTION_TYPES[o.type].bufferMm > 0).length;
+    showObstructionsSummary(
+      "ok",
+      `${stored.length === 1 ? "1 Obstruction" : `${stored.length} Obstructions`} stored ` +
+        `in wall coordinates (${obstructionCensus()}). ` +
+        (buffered > 0
+          ? "The red hatched Exclusion Zones show the 600 mm clearance " +
+            "AS/NZS 5139 requires around openings — the product must stay " +
+            "out of those too. "
+          : "") +
+        "Tap an outline to select it; drag to move, corners to resize.",
+    );
+  }
+}
+
+/**
+ * Arm step 6 on the freshly confirmed wall bounds. Always starts empty:
+ * every path here means the outlines' datum is new (first confirmation,
+ * re-confirmation after a guide moved, or a new capture), and session.js
+ * has already dropped any previous record for exactly that reason.
+ */
+function showObstructionsStep() {
+  if (!hasConfirmedWallBounds() || !bounds.meta) return;
+  obst.meta = bounds.meta;
+  obst.image = bounds.image;
+  obst.wallPx = wallBoundsToImagePx(session.wallBounds, obst.meta);
+  obst.list = [];
+  obst.zonesPx = [];
+  obst.selected = -1;
+  obst.traceArmed = false;
+  obst.tracePreview = null;
+  // The mm guardrail, capped so tiny test images can still trace at all.
+  obst.minSizePx = Math.min(
+    Math.max(4, MIN_OBSTRUCTION_MM / obst.meta.mmPerPx),
+    (obst.wallPx.right - obst.wallPx.left) / 4,
+    (obst.wallPx.bottom - obst.wallPx.top) / 4,
+  );
+  obstSection.hidden = false;
+  sizeObstCanvas();
+  obst.view = fitTransform(
+    obst.meta.widthPx,
+    obst.meta.heightPx,
+    obstCanvas.width,
+    obstCanvas.height,
+  );
+  syncObstructions();
+  obstSection.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+/** Tear step 6 down when its gate re-locks (bounds un-confirmed or a new
+ *  capture). The session record is already gone — session.js clears it on
+ *  every path that gets here — this only retires the on-screen state. */
+function hideObstructionsStep() {
+  obstSection.hidden = true;
+  obst.meta = null;
+  obst.image = null;
+  obst.wallPx = null;
+  obst.list = [];
+  obst.zonesPx = [];
+  obst.selected = -1;
+  obst.traceArmed = false;
+  obst.tracePreview = null;
+}
+
+function wireObstructionsStep() {
+  // The type picker is built from the same reviewable config the buffers
+  // come from — the UI can never offer a type the core has no buffer for.
+  for (const [type, def] of Object.entries(OBSTRUCTION_TYPES)) {
+    const option = document.createElement("option");
+    option.value = type;
+    option.textContent =
+      def.bufferMm > 0 ? `${def.label} (${def.bufferMm} mm zone)` : def.label;
+    obstTypeSelect.append(option);
+  }
+  obstTypeSelect.value = DEFAULT_OBSTRUCTION_TYPE;
+
+  wireImageGestures(obstCanvas, {
+    enabled: () => obst.image !== null,
+    imageSize: () => [obst.meta.widthPx, obst.meta.heightPx],
+    getView: () => obst.view,
+    setView: (t) => {
+      obst.view = t;
+    },
+    sizeCanvas: sizeObstCanvas,
+    draw: drawObstructions,
+    beginSingle: (p) => {
+      const start = viewToImage(obst.view, p);
+
+      if (obst.traceArmed) {
+        return {
+          move: (q) => {
+            obst.tracePreview = traceRect(start, viewToImage(obst.view, q), obst.wallPx);
+            drawObstructions();
+          },
+          end: () => {
+            const rect = obst.tracePreview ?? traceRect(start, start, obst.wallPx);
+            obst.tracePreview = null;
+            obst.traceArmed = false;
+            if (meetsMinSize(rect, obst.minSizePx)) {
+              obst.list.push({ ...rect, type: obstTypeSelect.value });
+              // Deliberately NOT auto-selected: the picker retypes the
+              // current selection, so auto-selecting would make "trace a
+              // window, then pick Pipe for the next trace" silently retype
+              // the window — a 600 mm compliance hole from one tap. Retyping
+              // is always an explicit tap-then-pick.
+              obst.selected = -1;
+              syncObstructions();
+            } else {
+              // A tap or a sliver: honest no-op, and say what to do instead.
+              updateObstructionControls();
+              drawObstructions();
+              showObstructionsSummary(
+                "warn",
+                "That rectangle was too small to be an obstruction — press " +
+                  "“Trace obstruction” and drag across the whole feature " +
+                  "(pinch to zoom in first for small ones).",
+              );
+            }
+          },
+          cancel: () => {
+            // Second finger arrived: the trace becomes a pinch, nothing is
+            // committed, and the button must be pressed again — a half-drawn
+            // rectangle is not an Obstruction.
+            obst.tracePreview = null;
+            obst.traceArmed = false;
+            updateObstructionControls();
+            drawObstructions();
+          },
+        };
+      }
+
+      const hit = hitObstruction(
+        obst.list,
+        obst.selected,
+        obst.view,
+        p,
+        HANDLE_SLOP_CSS_PX * obstUnit(),
+      );
+      if (!hit) return null; // empty wall: the default pan (tap deselects)
+
+      if (hit.part === "inside") {
+        if (obst.selected !== hit.index) {
+          obst.selected = hit.index;
+          updateObstructionControls();
+          drawObstructions();
+        }
+        // Drag to move: anchored to where inside the outline the finger
+        // landed, so the rectangle doesn't jump to centre under the finger.
+        const grabbed = obst.list[hit.index];
+        const offset = [start[0] - grabbed.left, start[1] - grabbed.top];
+        return {
+          move: (q) => {
+            const [ix, iy] = viewToImage(obst.view, q);
+            const current = obst.list[hit.index];
+            const moved = moveRectBy(
+              current,
+              ix - offset[0] - current.left,
+              iy - offset[1] - current.top,
+              obst.wallPx,
+            );
+            if (moved.left !== current.left || moved.top !== current.top) {
+              obst.list[hit.index] = { ...moved, type: current.type };
+              syncObstructions();
+            }
+          },
+        };
+      }
+
+      // Corner handle of the selected outline: resize.
+      return {
+        move: (q) => {
+          const current = obst.list[hit.index];
+          const resized = resizeRect(
+            current,
+            hit.part,
+            viewToImage(obst.view, q),
+            obst.wallPx,
+            obst.minSizePx,
+          );
+          if (
+            resized.left !== current.left ||
+            resized.top !== current.top ||
+            resized.right !== current.right ||
+            resized.bottom !== current.bottom
+          ) {
+            obst.list[hit.index] = { ...resized, type: current.type };
+            syncObstructions();
+          }
+        },
+      };
+    },
+    // A tap on empty wall clears the selection (and its handles).
+    tap: () => {
+      if (obst.selected < 0) return;
+      obst.selected = -1;
+      updateObstructionControls();
+      drawObstructions();
+    },
+  });
+
+  traceObstructionBtn.addEventListener("click", () => {
+    if (!obst.meta) return;
+    obst.traceArmed = !obst.traceArmed;
+    if (obst.traceArmed && obst.selected >= 0) {
+      // Arming a trace is about the NEXT obstruction: drop the selection so
+      // the type picker reads as "type of what I'm about to trace", not as
+      // a retype of what happens to be selected.
+      obst.selected = -1;
+      drawObstructions();
+    }
+    updateObstructionControls();
+    if (obst.traceArmed) {
+      showObstructionsSummary(
+        "ok",
+        `Drag a rectangle over the ${OBSTRUCTION_TYPES[obstTypeSelect.value].label.toLowerCase()} ` +
+          "— corner to corner. Pinch to zoom first if it is small.",
+      );
+    }
+  });
+
+  deleteObstructionBtn.addEventListener("click", () => {
+    if (!obst.meta || obst.selected < 0) return;
+    obst.list.splice(obst.selected, 1);
+    obst.selected = -1;
+    syncObstructions();
+  });
+
+  // Retype the selected Obstruction in place: its Exclusion Zone follows
+  // immediately (a window mistyped as a pipe is a 600 mm compliance hole).
+  obstTypeSelect.addEventListener("change", () => {
+    if (!obst.meta || obst.selected < 0) return;
+    const current = obst.list[obst.selected];
+    obst.list[obst.selected] = { ...current, type: obstTypeSelect.value };
+    syncObstructions();
   });
 }
 
@@ -1265,6 +1809,7 @@ async function main() {
   wireScaleStep(ruler_nominal_mm());
   wireMeasureTool();
   wireBoundsStep();
+  wireObstructionsStep();
 
   startCaptureBtn.addEventListener("click", () => {
     if (!hasVerifiedPrintScale()) return; // button is disabled anyway

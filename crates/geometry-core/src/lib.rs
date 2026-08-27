@@ -18,6 +18,7 @@ use wasm_bindgen::prelude::*;
 
 pub mod calib;
 pub mod detect;
+pub mod exclusion;
 pub mod homography;
 pub mod linalg;
 pub mod marker;
@@ -570,6 +571,32 @@ impl PanWallImage {
     pub fn link_rms_px(&self) -> Vec<f64> {
         self.out.links.iter().map(|l| l.rms_px).collect()
     }
+}
+
+/// Exclusion Zones from typed Obstruction outlines (issue #8), all in
+/// metric wall coordinates (mm, y down — the Rectified Wall Image frame).
+///
+/// * `outlines_mm` — 4 values per Obstruction: `[left, top, right, bottom]`.
+/// * `buffers_mm` — one compliance buffer per Obstruction (the page maps
+///   the Obstruction's TYPE to its buffer via the reviewable config in
+///   `web/obstruction-types.js`; this core only does the geometry).
+/// * `wall_mm` — the confirmed Wall bounds, `[left, top, right, floor]`
+///   (`floor` = the Floor Line, the wall rectangle's largest y).
+///
+/// Returns 4 values per zone in the SAME order as the input, each zone the
+/// outline inflated by its buffer and clipped to the Wall bounds.
+/// Overlapping zones are returned as separate rectangles, deliberately not
+/// unioned (see [`exclusion`] module docs). Errors instead of guessing on
+/// malformed input: length mismatches, non-finite values, negative buffers,
+/// a degenerate wall, degenerate outlines, or an outline entirely outside
+/// the Wall (the UI clamps outlines inside it, so that is a caller bug).
+#[wasm_bindgen]
+pub fn exclusion_zones_mm(
+    outlines_mm: &[f64],
+    buffers_mm: &[f64],
+    wall_mm: &[f64],
+) -> Result<Vec<f64>, JsError> {
+    exclusion::exclusion_zones_flat(outlines_mm, buffers_mm, wall_mm).map_err(JsError::new)
 }
 
 /// Full printed cell grid of a Reference Marker, row-major, 36 bytes,

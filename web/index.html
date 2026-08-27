@@ -90,11 +90,21 @@
       cursor: crosshair;
       touch-action: manipulation;
     }
-    /* Wall bounds + Floor Line confirmation (issue #7): the canvas handles
-       ALL its own gestures (drag guides, pinch-zoom, pan), so the browser
-       must not consume any of them for scrolling — hence touch-action:none
+    select {
+      padding: 0.45rem;
+      font-size: 0.9rem;
+      background: #222;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 6px;
+    }
+    /* Wall bounds + Floor Line confirmation (issue #7) and Obstruction
+       tracing (issue #8): these canvases handle ALL their own gestures
+       (drag guides/outlines, pinch-zoom, pan), so the browser must not
+       consume any of them for scrolling — hence touch-action:none
        (the rest of the page stays scrollable). */
-    #bounds-canvas {
+    #bounds-canvas,
+    #obstructions-canvas {
       display: block;
       width: 100%;
       height: min(60vh, 420px);
@@ -205,6 +215,28 @@
       </div>
       <div id="bounds-summary" class="result" role="status"></div>
       <div id="bounds-gate" class="result" role="status"></div>
+    </section>
+
+    <section id="step-obstructions" hidden>
+      <h2>6 · Trace the Obstructions</h2>
+      <p>
+        Mark everything on the wall the product cannot overlap — windows,
+        doors, pipes, meter boxes, vents. Pick a type, press
+        <strong>Trace</strong>, then drag a rectangle over the obstruction.
+        Tap an outline to select it, drag it to move, drag its corners to
+        resize, or delete it. The <strong>red hatched area</strong> around an
+        outline is its Exclusion Zone — the clearance the standard requires
+        (600&nbsp;mm around openable windows and doors), which the product
+        must also stay out of.
+      </p>
+      <canvas id="obstructions-canvas"></canvas>
+      <div>
+        <label for="obstruction-type">Obstruction type</label>
+        <select id="obstruction-type"></select>
+        <button id="trace-obstruction" class="primary">Trace obstruction</button>
+        <button id="delete-obstruction" disabled>Delete selected</button>
+      </div>
+      <div id="obstructions-summary" class="result" role="status"></div>
     </section>
 
     <div id="error" role="alert"></div>
