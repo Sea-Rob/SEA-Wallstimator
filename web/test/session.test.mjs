@@ -15,6 +15,8 @@ const RECT = {
   widthPx: 800,
   heightPx: 600,
   mmPerPx: 0.85,
+  originXMm: -60,
+  originYMm: -45,
   markerIds: [0],
   residualRmsPx: 0.21,
   residualMaxPx: 0.4,
@@ -173,6 +175,15 @@ test("distortion-only outcome: appliedK1 stored without a focal claim; pinhole p
   assert.equal(pinhole.appliedK1, null);
 });
 
+test("still record stores the wall-plane origin the bounds confirmation converts through", () => {
+  resetSession();
+  recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
+  lockForCapture();
+  const stored = recordRectifiedWallImage(RECT);
+  assert.equal(stored.originXMm, -60);
+  assert.equal(stored.originYMm, -45);
+});
+
 test("pan record coexists with the still rectified record and resets with the session", () => {
   resetSession();
   recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
@@ -184,4 +195,118 @@ test("pan record coexists with the still rectified record and resets with the se
   resetSession();
   assert.equal(session.pan, null);
   assert.equal(session.rectified, null);
+});
+
+// --- Wall bounds + Floor Line (issue #7 slice) ------------------------------
+
+const { recordWallBounds, clearWallBounds, hasConfirmedWallBounds } = await import(
+  "../session.js"
+);
+
+// Inside the PAN fixture's extent (x -140..4060 mm, y -110..690 mm): the
+// containment cross-check refuses bounds the source image cannot
+// substantiate.
+const BOUNDS = {
+  leftXMm: 60,
+  rightXMm: 3180,
+  topYMm: -30,
+  floorYMm: 620,
+  source: "pan",
+};
+
+// Inside the RECT (still) fixture's extent (x -60..620 mm, y -45..465 mm).
+const STILL_BOUNDS = {
+  leftXMm: -20,
+  rightXMm: 600,
+  topYMm: -30,
+  floorYMm: 440,
+  source: "still",
+};
+
+function startedSession() {
+  resetSession();
+  recordPrintScale({ measuredMm: 200, nominalMm: 200, correctionFactor: 1 });
+  lockForCapture();
+}
+
+test("wall bounds cannot be recorded before print scale / capture / an image", () => {
+  resetSession();
+  assert.equal(recordWallBounds(BOUNDS), null);
+
+  startedSession();
+  // No Rectified Wall Image yet: nothing the guides could have been placed on.
+  assert.equal(recordWallBounds(BOUNDS), null);
+  assert.equal(session.wallBounds, null);
+  assert.equal(hasConfirmedWallBounds(), false);
+});
+
+test("wall bounds require the record their source names", () => {
+  startedSession();
+  recordRectifiedWallImage(RECT); // still only
+  assert.equal(recordWallBounds(BOUNDS), null, "pan-sourced bounds need a pan record");
+  const stored = recordWallBounds(STILL_BOUNDS);
+  assert.ok(stored);
+  assert.equal(stored.source, "still");
+  assert.equal(recordWallBounds({ ...STILL_BOUNDS, source: "elsewhere" }), null);
+});
+
+test("wall bounds store frozen metric coordinates with derived width/height", () => {
+  startedSession();
+  recordPanResult(PAN);
+  const stored = recordWallBounds(BOUNDS);
+  assert.equal(stored, session.wallBounds);
+  assert.ok(Object.isFrozen(stored), "bounds record must be immutable");
+  assert.equal(stored.leftXMm, 60);
+  assert.equal(stored.floorYMm, 620);
+  assert.equal(stored.widthMm, 3120);
+  assert.equal(stored.heightMm, 650);
+  assert.equal(hasConfirmedWallBounds(), true);
+});
+
+test("degenerate or non-finite rectangles are refused", () => {
+  startedSession();
+  recordPanResult(PAN);
+  assert.equal(recordWallBounds({ ...BOUNDS, rightXMm: BOUNDS.leftXMm }), null);
+  assert.equal(recordWallBounds({ ...BOUNDS, floorYMm: BOUNDS.topYMm - 1 }), null);
+  assert.equal(recordWallBounds({ ...BOUNDS, leftXMm: NaN }), null);
+  assert.equal(session.wallBounds, null);
+});
+
+test("bounds outside the source image's extent are refused (containment cross-check)", () => {
+  startedSession();
+  recordPanResult(PAN); // extent: x -140..4060 mm, y -110..690 mm
+  assert.equal(recordWallBounds({ ...BOUNDS, floorYMm: 800 }), null, "below the image");
+  assert.equal(recordWallBounds({ ...BOUNDS, leftXMm: -200 }), null, "left of the image");
+  assert.equal(recordWallBounds({ ...BOUNDS, rightXMm: 4200 }), null, "right of the image");
+  assert.equal(recordWallBounds({ ...BOUNDS, topYMm: -150 }), null, "above the image");
+  assert.equal(session.wallBounds, null);
+  // Exactly on the extent (within the half-pixel rounding slack) is fine.
+  assert.ok(recordWallBounds({ ...BOUNDS, leftXMm: -140, rightXMm: 4060, floorYMm: 690 }));
+});
+
+test("re-capturing invalidates confirmed bounds: the image they described is gone", () => {
+  startedSession();
+  recordPanResult(PAN);
+  recordWallBounds(BOUNDS);
+  assert.ok(session.wallBounds);
+  recordPanResult(PAN); // re-recorded pan
+  assert.equal(session.wallBounds, null);
+
+  recordRectifiedWallImage(RECT);
+  recordWallBounds(STILL_BOUNDS);
+  assert.ok(session.wallBounds);
+  recordRectifiedWallImage(RECT); // re-captured still
+  assert.equal(session.wallBounds, null);
+});
+
+test("clearWallBounds drops the record (guide moved after confirm) and reset clears it", () => {
+  startedSession();
+  recordPanResult(PAN);
+  recordWallBounds(BOUNDS);
+  clearWallBounds();
+  assert.equal(session.wallBounds, null);
+
+  recordWallBounds(BOUNDS);
+  resetSession();
+  assert.equal(session.wallBounds, null);
 });

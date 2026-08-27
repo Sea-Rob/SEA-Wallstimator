@@ -21,6 +21,11 @@ function blankState() {
     // closure status and the session's Error Bound. Pixels stay on the
     // canvas; re-recording replaces it.
     pan: null,
+    // Confirmed Wall bounds + Floor Line (issue #7), in metric wall
+    // coordinates (mm; y grows downward, matching the Rectified Wall
+    // Image). Null until the Homeowner explicitly confirms — later steps
+    // (Obstruction tracing, fit checking) are gated on this being set.
+    wallBounds: null,
   };
 }
 
@@ -53,6 +58,8 @@ export function recordRectifiedWallImage({
   widthPx,
   heightPx,
   mmPerPx,
+  originXMm,
+  originYMm,
   markerIds,
   secondMarkerRejected,
   residualRmsPx,
@@ -67,6 +74,11 @@ export function recordRectifiedWallImage({
     widthPx,
     heightPx,
     mmPerPx,
+    // Wall-plane mm coordinate of the image's top-left pixel: with mmPerPx
+    // this maps any image pixel to metric wall coordinates (issue #7's
+    // bounds confirmation converts through exactly this pair).
+    originXMm,
+    originYMm,
     markerIds,
     secondMarkerRejected: Boolean(secondMarkerRejected),
     residualRmsPx,
@@ -74,6 +86,9 @@ export function recordRectifiedWallImage({
     pointsUsed,
     inliers,
   });
+  // Bounds confirmed on a PREVIOUS image describe pixels that no longer
+  // exist — a re-capture always invalidates the confirmation.
+  session.wallBounds = null;
   return session.rectified;
 }
 
@@ -145,7 +160,73 @@ export function recordPanResult({
     errorBoundFullSpanMm,
     linkInliers: Object.freeze(Array.from(linkInliers ?? [])),
   });
+  // Same invalidation as the still path: a re-recorded pan replaces the
+  // Rectified Wall Image the bounds were confirmed against.
+  session.wallBounds = null;
   return session.pan;
+}
+
+/**
+ * Store the Homeowner's explicitly confirmed Wall bounds + Floor Line
+ * (issue #7) in metric wall coordinates. `source` names which Rectified
+ * Wall Image the guides were placed on ("pan" or "still") and that record
+ * must exist — bounds without an image to have been confirmed against are
+ * meaningless. Wall y grows downward, so the Floor Line is the rectangle's
+ * LARGEST y; a height above the floor is `floorYMm - yMm`. Degenerate
+ * rectangles are refused (the UI's clamping should make them impossible;
+ * refusing here keeps the session record trustworthy regardless).
+ */
+export function recordWallBounds({ leftXMm, rightXMm, topYMm, floorYMm, source }) {
+  if (!session.printScale || !session.captureStarted) {
+    return null;
+  }
+  const image = source === "pan" ? session.pan : source === "still" ? session.rectified : null;
+  if (!image) {
+    return null;
+  }
+  const values = [leftXMm, rightXMm, topYMm, floorYMm];
+  if (!values.every(Number.isFinite) || rightXMm <= leftXMm || floorYMm <= topYMm) {
+    return null;
+  }
+  // Containment cross-check against the source image's own extent (review
+  // hardening): the UI clamps guides to the image, so bounds outside it can
+  // only come from a buggy caller — refuse rather than store coordinates
+  // the image cannot substantiate. Half a pixel of slack absorbs rounding.
+  const slackMm = image.mmPerPx / 2;
+  const maxXMm = image.originXMm + image.widthPx * image.mmPerPx;
+  const maxYMm = image.originYMm + image.heightPx * image.mmPerPx;
+  if (
+    leftXMm < image.originXMm - slackMm ||
+    rightXMm > maxXMm + slackMm ||
+    topYMm < image.originYMm - slackMm ||
+    floorYMm > maxYMm + slackMm
+  ) {
+    return null;
+  }
+  session.wallBounds = Object.freeze({
+    leftXMm,
+    rightXMm,
+    topYMm,
+    floorYMm,
+    // Derived once here so every consumer agrees on them.
+    widthMm: rightXMm - leftXMm,
+    heightMm: floorYMm - topYMm,
+    source,
+  });
+  return session.wallBounds;
+}
+
+/**
+ * Drop a confirmed bounds record: the Homeowner moved a guide after
+ * confirming, so the stored rectangle no longer matches what is on screen
+ * and later steps must re-lock until they re-confirm.
+ */
+export function clearWallBounds() {
+  session.wallBounds = null;
+}
+
+export function hasConfirmedWallBounds() {
+  return session.wallBounds !== null;
 }
 
 export function hasVerifiedPrintScale() {
