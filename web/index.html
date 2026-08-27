@@ -90,6 +90,20 @@
       cursor: crosshair;
       touch-action: manipulation;
     }
+    /* Wall bounds + Floor Line confirmation (issue #7): the canvas handles
+       ALL its own gestures (drag guides, pinch-zoom, pan), so the browser
+       must not consume any of them for scrolling — hence touch-action:none
+       (the rest of the page stays scrollable). */
+    #bounds-canvas {
+      display: block;
+      width: 100%;
+      height: min(60vh, 420px);
+      background: #000;
+      border-radius: 8px;
+      margin-top: 0.75rem;
+      touch-action: none;
+      cursor: grab;
+    }
     #error {
       display: none;
       margin: 1rem 0;
@@ -172,6 +186,25 @@
       <div id="error-bound" class="result" role="status"></div>
       <div id="measure-result" class="result" role="status"></div>
       <button id="clear-measure" hidden>Clear points</button>
+    </section>
+
+    <section id="step-bounds" hidden>
+      <h2>5 · Confirm the wall edges and the Floor Line</h2>
+      <p>
+        Drag the <strong>blue guides</strong> to the left, right and top edges
+        of the wall, and the <strong>amber Floor Line</strong> to where the
+        wall meets the floor. Pinch to zoom (mouse: scroll) and drag the image
+        to move around for precise placement.
+      </p>
+      <canvas id="bounds-canvas"></canvas>
+      <div>
+        <button id="confirm-bounds" class="primary" disabled>
+          Confirm wall edges &amp; Floor Line
+        </button>
+        <button id="reset-guides" disabled>Reset guides</button>
+      </div>
+      <div id="bounds-summary" class="result" role="status"></div>
+      <div id="bounds-gate" class="result" role="status"></div>
     </section>
 
     <div id="error" role="alert"></div>

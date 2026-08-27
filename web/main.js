@@ -24,10 +24,25 @@ import init, {
 import { evaluateRulerMeasurement } from "./print-scale.js";
 import { pickMainRearCamera, zoomLockConstraint } from "./camera.js";
 import {
+  initialGuides,
+  moveGuide,
+  fitTransform,
+  imageToView,
+  viewToImage,
+  clampTransform,
+  zoomAt,
+  panBy,
+  pinchTransform,
+  hitGuide,
+  guidesToWallMm,
+} from "./wall-bounds.js";
+import {
   session,
   recordPrintScale,
   recordRectifiedWallImage,
   recordPanResult,
+  recordWallBounds,
+  clearWallBounds,
   hasVerifiedPrintScale,
   lockForCapture,
 } from "./session.js";
@@ -59,6 +74,13 @@ const rectifiedCanvas = document.getElementById("rectified");
 const rectifiedCtx = rectifiedCanvas.getContext("2d");
 const measureResult = document.getElementById("measure-result");
 const clearMeasureBtn = document.getElementById("clear-measure");
+const boundsSection = document.getElementById("step-bounds");
+const boundsCanvas = document.getElementById("bounds-canvas");
+const boundsCtx = boundsCanvas.getContext("2d");
+const confirmBoundsBtn = document.getElementById("confirm-bounds");
+const resetGuidesBtn = document.getElementById("reset-guides");
+const boundsSummary = document.getElementById("bounds-summary");
+const boundsGate = document.getElementById("bounds-gate");
 
 // Debug / test handle: lets DevTools (and smoke tests) inspect session state.
 window.wallstimatorSession = session;
@@ -635,6 +657,329 @@ function wireMeasureTool() {
   clearMeasureBtn.addEventListener("click", clearMeasurePoints);
 }
 
+// ---------------------------------------------------------------------------
+// Step 5 — Wall bounds + Floor Line confirmation (issue #7).
+//
+// The Homeowner drags three edge guides and the Floor Line on the Rectified
+// Wall Image, then explicitly confirms; the confirmed rectangle is stored in
+// METRIC wall coordinates (session.wallBounds) and gates every later step
+// (Obstruction tracing, fit checking). All coordinate math lives in the pure
+// wall-bounds.js module — this block only routes pointer events and draws.
+
+// Finger-sized grab distance for a guide, in CSS pixels: measured in view
+// space so zooming in refines placement without shrinking the target.
+const HANDLE_SLOP_CSS_PX = 26;
+
+// Guide clamping guardrail, NOT a product judgement: guides can't be pushed
+// into a rectangle smaller than this, so a confirmed wall always has
+// meaningfully positive area even after a stray drag.
+const MIN_WALL_DIMENSION_MM = 100;
+
+const bounds = {
+  meta: null, // {widthPx, heightPx, mmPerPx, originXMm, originYMm, source}
+  image: null, // offscreen canvas holding the rectified pixels
+  guides: null, // image-px guide positions (wall-bounds.js shape)
+  view: null, // zoom/pan transform image->view (wall-bounds.js shape)
+  minGapPx: 0,
+  confirmed: false,
+  pointers: new Map(), // active pointerId -> [x, y] view px
+  mode: null, // {type:"drag", guide} | {type:"pan"} | {type:"pinch"}
+};
+
+/** Match the canvas backing store to its CSS box (times devicePixelRatio)
+ *  so guide lines stay crisp; the view transform works in backing px. */
+function sizeBoundsCanvas() {
+  const rect = boundsCanvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(2, Math.round(rect.width * dpr));
+  const h = Math.max(2, Math.round(rect.height * dpr));
+  if (boundsCanvas.width !== w || boundsCanvas.height !== h) {
+    boundsCanvas.width = w;
+    boundsCanvas.height = h;
+  }
+}
+
+/** Backing pixels per CSS pixel — sizes strokes/handles/slop finger-true. */
+function boundsUnit() {
+  const rect = boundsCanvas.getBoundingClientRect();
+  return rect.width > 0 ? boundsCanvas.width / rect.width : 1;
+}
+
+function drawBounds() {
+  const W = boundsCanvas.width;
+  const H = boundsCanvas.height;
+  const t = bounds.view;
+  const g = bounds.guides;
+  const u = boundsUnit();
+
+  boundsCtx.setTransform(1, 0, 0, 1, 0, 0);
+  boundsCtx.fillStyle = "#000";
+  boundsCtx.fillRect(0, 0, W, H);
+  boundsCtx.setTransform(t.scale, 0, 0, t.scale, t.tx, t.ty);
+  boundsCtx.drawImage(bounds.image, 0, 0);
+  boundsCtx.setTransform(1, 0, 0, 1, 0, 0);
+
+  // Guide positions in view px. Lines are drawn across the full view (not
+  // just the image) so a guide near the letterbox edge stays visible.
+  const [l] = imageToView(t, [g.left, 0]);
+  const [r] = imageToView(t, [g.right, 0]);
+  const [, tp] = imageToView(t, [0, g.top]);
+  const [, fl] = imageToView(t, [0, g.floor]);
+
+  // Dim everything outside the bounded rectangle: the kept region reads as
+  // "the wall" at a glance, mistakes are obvious.
+  boundsCtx.fillStyle = "rgba(0, 0, 0, 0.5)";
+  boundsCtx.fillRect(0, 0, l, H);
+  boundsCtx.fillRect(r, 0, W - r, H);
+  boundsCtx.fillRect(l, 0, r - l, tp);
+  boundsCtx.fillRect(l, fl, r - l, H - fl);
+
+  const line = (x1, y1, x2, y2, style, widthPx) => {
+    boundsCtx.strokeStyle = style;
+    boundsCtx.lineWidth = widthPx;
+    boundsCtx.beginPath();
+    boundsCtx.moveTo(x1, y1);
+    boundsCtx.lineTo(x2, y2);
+    boundsCtx.stroke();
+  };
+  const handle = (x, y, style) => {
+    if (x < 0 || x > W || y < 0 || y > H) return; // guide off-view: no grip
+    boundsCtx.fillStyle = style;
+    boundsCtx.strokeStyle = "#111";
+    boundsCtx.lineWidth = 2 * u;
+    boundsCtx.beginPath();
+    boundsCtx.arc(x, y, 12 * u, 0, 2 * Math.PI);
+    boundsCtx.fill();
+    boundsCtx.stroke();
+  };
+
+  // Wall edges in blue; the Floor Line thicker and amber — it is a different
+  // KIND of thing (the vertical datum), not a fourth edge.
+  const EDGE = "#5ad1ff";
+  const FLOOR = "#fc6";
+  line(l, 0, l, H, EDGE, 2 * u);
+  line(r, 0, r, H, EDGE, 2 * u);
+  line(0, tp, W, tp, EDGE, 2 * u);
+  line(0, fl, W, fl, FLOOR, 4 * u);
+  handle(l, H / 2, EDGE);
+  handle(r, H / 2, EDGE);
+  handle(W / 2, tp, EDGE);
+  handle(W / 2, fl, FLOOR);
+  if (fl >= 0 && fl <= H) {
+    boundsCtx.fillStyle = FLOOR;
+    boundsCtx.font = `${13 * u}px system-ui, sans-serif`;
+    boundsCtx.fillText("Floor Line", W / 2 + 18 * u, fl - 8 * u);
+  }
+}
+
+/** Live width × height readout while placing, mm readback once confirmed. */
+function updateBoundsGate() {
+  confirmBoundsBtn.disabled = !bounds.meta || bounds.confirmed;
+  resetGuidesBtn.disabled = !bounds.meta;
+  if (!bounds.meta) return;
+  if (bounds.confirmed && session.wallBounds) {
+    const b = session.wallBounds;
+    boundsSummary.className = "result ok";
+    boundsSummary.textContent =
+      `Confirmed: wall ${b.widthMm.toFixed(0)} mm wide × ` +
+      `${b.heightMm.toFixed(0)} mm from the Floor Line to the top edge ` +
+      `(stored in wall coordinates from the ${b.source === "pan" ? "recorded pan" : "captured frame"}).`;
+    boundsGate.className = "result ok";
+    boundsGate.textContent =
+      "Wall bounds and Floor Line locked in — the next step (tracing " +
+      "Obstructions) will work inside them. Moving any guide unlocks " +
+      "re-confirmation.";
+  } else {
+    const mm = guidesToWallMm(bounds.guides, bounds.meta);
+    boundsSummary.className = "result ok";
+    boundsSummary.textContent =
+      `Current guides: ${(mm.rightXMm - mm.leftXMm).toFixed(0)} mm wide × ` +
+      `${(mm.floorYMm - mm.topYMm).toFixed(0)} mm from the Floor Line to the top edge.`;
+    boundsGate.className = "result warn";
+    boundsGate.textContent =
+      "Not confirmed yet — the following steps stay locked until you place " +
+      "the guides and press Confirm.";
+  }
+}
+
+/** A guide moved: any prior confirmation no longer describes the screen. */
+function unconfirmBounds() {
+  if (!bounds.confirmed) return;
+  bounds.confirmed = false;
+  clearWallBounds();
+}
+
+function confirmBounds() {
+  if (!bounds.meta || bounds.confirmed) return;
+  const mm = guidesToWallMm(bounds.guides, bounds.meta);
+  const stored = recordWallBounds({ ...mm, source: bounds.meta.source });
+  if (!stored) {
+    // Should be unreachable (guides are clamped, the image record exists),
+    // but a silent no-op here would fake a confirmation.
+    boundsSummary.className = "result warn";
+    boundsSummary.textContent =
+      "Could not store the wall bounds — re-capture the wall and try again.";
+    return;
+  }
+  bounds.confirmed = true;
+  updateBoundsGate();
+}
+
+/**
+ * Arm step 5 on a freshly rendered Rectified Wall Image (still or pan).
+ * Guides reset to the image extent and the confirmation resets with them:
+ * bounds confirmed on a previous image describe pixels that no longer
+ * exist (session.js already dropped the wallBounds record).
+ */
+function showBoundsStep(meta) {
+  bounds.meta = meta;
+  // Offscreen copy of the rectified pixels: cheap redraws under zoom/pan
+  // without touching the measure canvas above.
+  const img = document.createElement("canvas");
+  img.width = meta.widthPx;
+  img.height = meta.heightPx;
+  img.getContext("2d").putImageData(rectified.imageData, 0, 0);
+  bounds.image = img;
+  bounds.guides = initialGuides(meta.widthPx, meta.heightPx);
+  // The mm guardrail, capped so a small test image can still move guides.
+  bounds.minGapPx = Math.min(
+    Math.max(4, MIN_WALL_DIMENSION_MM / meta.mmPerPx),
+    meta.widthPx / 4,
+    meta.heightPx / 4,
+  );
+  bounds.confirmed = false;
+  bounds.pointers.clear();
+  bounds.mode = null;
+  boundsSection.hidden = false;
+  sizeBoundsCanvas();
+  bounds.view = fitTransform(meta.widthPx, meta.heightPx, boundsCanvas.width, boundsCanvas.height);
+  drawBounds();
+  updateBoundsGate();
+}
+
+function wireBoundsStep() {
+  const viewSize = () => [boundsCanvas.width, boundsCanvas.height];
+
+  boundsCanvas.addEventListener("pointerdown", (event) => {
+    if (!bounds.image) return;
+    event.preventDefault();
+    try {
+      boundsCanvas.setPointerCapture(event.pointerId);
+    } catch {
+      // No capturable pointer (synthetic events, some stylus edge cases):
+      // the drag still works, it just loses the off-canvas grace capture.
+    }
+    bounds.pointers.set(event.pointerId, canvasPoint(boundsCanvas, event));
+    if (bounds.pointers.size === 2) {
+      // Second finger always switches to pinch — even mid guide-drag: the
+      // Homeowner is asking for precision, not a bigger drag.
+      bounds.mode = { type: "pinch" };
+    } else if (bounds.pointers.size === 1) {
+      const p = bounds.pointers.get(event.pointerId);
+      const guide = hitGuide(bounds.guides, bounds.view, p, HANDLE_SLOP_CSS_PX * boundsUnit());
+      bounds.mode = guide ? { type: "drag", guide } : { type: "pan" };
+    }
+  });
+
+  boundsCanvas.addEventListener("pointermove", (event) => {
+    if (!bounds.image || !bounds.pointers.has(event.pointerId)) return;
+    event.preventDefault();
+    const p = canvasPoint(boundsCanvas, event);
+    const prev = bounds.pointers.get(event.pointerId);
+    const m = bounds.meta;
+    const [vw, vh] = viewSize();
+
+    if (bounds.mode?.type === "pinch" && bounds.pointers.size >= 2) {
+      const ids = [...bounds.pointers.keys()].slice(0, 2);
+      if (!ids.includes(event.pointerId)) return; // ignore a stray 3rd finger
+      const before = ids.map((id) => bounds.pointers.get(id));
+      bounds.pointers.set(event.pointerId, p);
+      const after = ids.map((id) => bounds.pointers.get(id));
+      bounds.view = pinchTransform(bounds.view, before, after, m.widthPx, m.heightPx, vw, vh);
+      drawBounds();
+      return;
+    }
+
+    bounds.pointers.set(event.pointerId, p);
+    if (bounds.mode?.type === "drag") {
+      const [ix, iy] = viewToImage(bounds.view, p);
+      const alongX = bounds.mode.guide === "left" || bounds.mode.guide === "right";
+      bounds.guides = moveGuide(
+        bounds.guides,
+        bounds.mode.guide,
+        alongX ? ix : iy,
+        m.widthPx,
+        m.heightPx,
+        bounds.minGapPx,
+      );
+      unconfirmBounds();
+      drawBounds();
+      updateBoundsGate();
+    } else if (bounds.mode?.type === "pan") {
+      bounds.view = panBy(bounds.view, p[0] - prev[0], p[1] - prev[1], m.widthPx, m.heightPx, vw, vh);
+      drawBounds();
+    }
+  });
+
+  const releasePointer = (event) => {
+    if (!bounds.pointers.delete(event.pointerId)) return;
+    if (bounds.pointers.size === 0) {
+      bounds.mode = null;
+    } else if (bounds.pointers.size === 1 && bounds.mode?.type === "pinch") {
+      bounds.mode = { type: "pan" }; // lifted one pinch finger: keep panning
+    }
+  };
+  boundsCanvas.addEventListener("pointerup", releasePointer);
+  boundsCanvas.addEventListener("pointercancel", releasePointer);
+
+  // Desktop precision without touch: wheel zooms about the cursor.
+  boundsCanvas.addEventListener(
+    "wheel",
+    (event) => {
+      if (!bounds.image) return;
+      event.preventDefault();
+      const m = bounds.meta;
+      bounds.view = zoomAt(
+        bounds.view,
+        canvasPoint(boundsCanvas, event),
+        event.deltaY < 0 ? 1.2 : 1 / 1.2,
+        m.widthPx,
+        m.heightPx,
+        boundsCanvas.width,
+        boundsCanvas.height,
+      );
+      drawBounds();
+    },
+    { passive: false },
+  );
+
+  confirmBoundsBtn.addEventListener("click", confirmBounds);
+  resetGuidesBtn.addEventListener("click", () => {
+    if (!bounds.meta) return;
+    bounds.guides = initialGuides(bounds.meta.widthPx, bounds.meta.heightPx);
+    bounds.view = fitTransform(bounds.meta.widthPx, bounds.meta.heightPx, boundsCanvas.width, boundsCanvas.height);
+    unconfirmBounds();
+    drawBounds();
+    updateBoundsGate();
+  });
+
+  // Rotating the phone / resizing the window reshapes the canvas box: keep
+  // the backing store matched and re-clamp the view (guides are image-px
+  // state, so they survive untouched).
+  window.addEventListener("resize", () => {
+    if (!bounds.image) return;
+    sizeBoundsCanvas();
+    bounds.view = clampTransform(
+      bounds.view,
+      bounds.meta.widthPx,
+      bounds.meta.heightPx,
+      boundsCanvas.width,
+      boundsCanvas.height,
+    );
+    drawBounds();
+  });
+}
+
 /**
  * Display the stitched full-wall Rectified Wall Image from a processed pan
  * and arm the (unchanged) two-point measure tool on it. The Error Bound is
@@ -661,6 +1006,7 @@ function showPanResult(wasm, image) {
   const truncated = image.truncated();
   const linkInliers = Array.from(image.link_inliers());
   const originXMm = image.origin_x_mm();
+  const originYMm = image.origin_y_mm();
   const farXMm = image.far_x_mm();
   const calibrated = image.calibrated();
   const calibratedFocalPx = image.calibrated_focal_px();
@@ -688,7 +1034,7 @@ function showPanResult(wasm, image) {
     heightPx: height,
     mmPerPx: rectified.mmPerPx,
     originXMm,
-    originYMm: image.origin_y_mm(),
+    originYMm,
     keyframesUsed: keyframes,
     truncated,
     closureApplied: closure,
@@ -712,6 +1058,14 @@ function showPanResult(wasm, image) {
   drawMeasureOverlay();
   rectifiedSection.hidden = false;
   updateMeasureReadout();
+  showBoundsStep({
+    widthPx: width,
+    heightPx: height,
+    mmPerPx: rectified.mmPerPx,
+    originXMm,
+    originYMm,
+    source: "pan",
+  });
 
   errorBoundEl.className = "result ok";
   errorBoundEl.textContent =
@@ -793,10 +1147,14 @@ function captureFrame(wasm, processor) {
 
     const markerIds = Array.from(image.marker_ids());
     const secondMarkerRejected = image.second_marker_rejected();
+    const originXMm = image.origin_x_mm();
+    const originYMm = image.origin_y_mm();
     const meta = recordRectifiedWallImage({
       widthPx: width,
       heightPx: height,
       mmPerPx: rectified.mmPerPx,
+      originXMm,
+      originYMm,
       markerIds,
       secondMarkerRejected,
       residualRmsPx: image.residual_rms_px(),
@@ -808,6 +1166,14 @@ function captureFrame(wasm, processor) {
     drawMeasureOverlay();
     rectifiedSection.hidden = false;
     updateMeasureReadout();
+    showBoundsStep({
+      widthPx: width,
+      heightPx: height,
+      mmPerPx: rectified.mmPerPx,
+      originXMm,
+      originYMm,
+      source: "still",
+    });
     // A single still has no chained Error Bound; don't leave a stale one up.
     errorBoundEl.className = "result";
     errorBoundEl.textContent = "";
@@ -862,6 +1228,7 @@ async function main() {
   // the PDF was generated from, so page copy can never drift from the print.
   wireScaleStep(ruler_nominal_mm());
   wireMeasureTool();
+  wireBoundsStep();
 
   startCaptureBtn.addEventListener("click", () => {
     if (!hasVerifiedPrintScale()) return; // button is disabled anyway
